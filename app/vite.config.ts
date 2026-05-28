@@ -454,17 +454,17 @@ function worldsPlugin(): Plugin {
     return requestMetadataFiles(worldDir, 'world').map((request) => request.index)
   }
 
-  // Synchronous mirror of request-metadata.mjs's nextIndex(): scan a directory for
-  // indexed files (visible + hidden request sidecars) whose slug matches and return
-  // the next free integer index. Matches the synchronous fs style used throughout.
-  function nextIndex(dir: string, slug: string) {
+  // Cube-capture files use a slug-first naming scheme (`cube-capture-<N>-<face>.png`),
+  // which the index-first parseIndexedName() convention cannot match. Scan the prefix
+  // pattern directly so repeated captures increment instead of overwriting index 0.
+  function nextCubeCaptureIndex(dir: string) {
     if (!fs.existsSync(dir)) return 0
     let maxIndex = -1
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isFile()) continue
-      const parsed = parseIndexedName(entry.name)
-      if (!parsed || parsed.slug !== slug || !Number.isInteger(parsed.index)) continue
-      maxIndex = Math.max(maxIndex, parsed.index)
+      const match = /^cube-capture-(\d+)-/.exec(entry.name)
+      if (!match) continue
+      maxIndex = Math.max(maxIndex, Number(match[1]))
     }
     return maxIndex + 1
   }
@@ -985,7 +985,7 @@ function worldsPlugin(): Plugin {
             buffers[key] = decoded
           }
 
-          const captureIndex = nextIndex(dir, 'cube-capture')
+          const captureIndex = nextCubeCaptureIndex(dir)
           fs.mkdirSync(dir, { recursive: true })
           const faceUrls: Record<string, string> = {}
           for (const key of CUBE_FACE_KEYS) {

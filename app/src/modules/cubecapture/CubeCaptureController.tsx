@@ -22,19 +22,65 @@ import {
  * When the cube-capture store transitions to `phase === 'capturing'`, it:
  *   1. forces `viewerQuality = High` so Spark renders with `encodeLinear = true`
  *      (consistent sRGB gamma for the inpaint → stitch → Marble pipeline),
- *   2. calls Spark's native `SparkRenderer.renderCubeMap(...)` at the camera's
- *      current world position to render the splat scene into a 1024² cube,
- *   3. reads back all six faces with `SparkRenderer.readCubeTargets()`,
+ *   2. renders each of the six cube faces SEPARATELY with its own
+ *      `THREE.PerspectiveCamera` (fov 90, aspect 1) positioned at the capture
+ *      world position, into a 1024² `WebGLRenderTarget`,
+ *   3. reads back each face with `readRenderTargetPixelsAsync`,
  *   4. encodes each face to a PNG data URL (flipping rows — WebGL readback is
  *      bottom-up), maps them to px/nx/py/ny/pz/nz,
  *   5. POSTs base64 PNGs to `/__cube-capture?slug=<slug>`,
  *   6. records the server result in the store and restores the prior quality.
+ *
+ * ── Why per-face cameras instead of `SparkRenderer.renderCubeMap()` ──────────
+ * Spark's `renderCubeMap` does a single radial gaussian sort around the capture
+ * point, then drives a `THREE.CubeCamera` which calls `renderer.render(scene,
+ * faceCamera)` six times in sequence. Because the SparkRenderer's `autoUpdate`
+ * is on, each of those six face renders is seen as a "new frame" by Spark's
+ * `onBeforeRender` hook, which kicks off a fresh async sort and swaps the splat
+ * accumulators mid-sequence. There are only two spare accumulators, so after the
+ * first ~2 faces the ordering texture is left stale/empty and the remaining
+ * faces render with mis-ordered (effectively invisible) gaussians — the empty
+ * faces bug.
+ *
+ * The radial sort metric is `length(center - worldCenter)` (see Spark's
+ * `computeSort` with `sortRadial`), which is direction-independent: ONE sort
+ * around the capture point is correct for all six face directions. So the fix is
+ * to (a) disable `autoUpdate` during capture so `onBeforeRender` uploads the
+ * per-face view matrix but does NOT re-sort/swap accumulators, (b) perform a
+ * single awaited radial sort via `spark.update(...)`, then (c) render each face
+ * with our own camera into a 2D render target. The face camera orientations
+ * exactly mirror three's `CubeCamera.updateCoordinateSystem()` (WebGL layout) so
+ * the faces round-trip through `CubeToEquirect` / `CubeToMultiImage` unchanged.
  */
 
-/** Cube-face buffer order returned by Spark/three: +X,-X,+Y,-Y,+Z,-Z. */
-const FACE_ORDER: readonly CubeFaceKey[] = ['px', 'nx', 'py', 'ny', 'pz', 'nz']
-
 const FACE_SIZE = 1024
+
+/**
+ * Per-face camera orientations. These MUST match three.js'
+ * `CubeCamera.updateCoordinateSystem()` for `WebGLCoordinateSystem` so that the
+ * captured faces are identical to what the old `CubeCamera`-backed path produced
+ * and stitch correctly in `CubeToEquirect` / `CubeToMultiImage`.
+ *
+ *   +X look (+1,0,0) up (0,1,0)   -X look (-1,0,0) up (0,1,0)
+ *   +Y look (0,1,0)  up (0,0,-1)  -Y look (0,-1,0) up (0,0,1)
+ *   +Z look (0,0,1)  up (0,1,0)   -Z look (0,0,-1) up (0,1,0)
+ */
+const FACE_ORIENTATIONS: readonly {
+  key: CubeFaceKey
+  look: readonly [number, number, number]
+  up: readonly [number, number, number]
+}[] = [
+  { key: 'px', look: [1, 0, 0], up: [0, 1, 0] },
+  { key: 'nx', look: [-1, 0, 0], up: [0, 1, 0] },
+  { key: 'py', look: [0, 1, 0], up: [0, 0, -1] },
+  { key: 'ny', look: [0, -1, 0], up: [0, 0, 1] },
+  { key: 'pz', look: [0, 0, 1], up: [0, 1, 0] },
+  { key: 'nz', look: [0, 0, -1], up: [0, 1, 0] },
+]
+
+/** Near/far for the face cameras — matches Spark's `renderCubeMap` defaults. */
+const FACE_NEAR = 0.1
+const FACE_FAR = 1e3
 
 /**
  * The `sparkRenderer` prop may be supplied as a live instance, a React ref
@@ -140,36 +186,87 @@ export function CubeCaptureController({ slug, sparkRenderer }: Props) {
 
     const capturePos = camera.getWorldPosition(new THREE.Vector3())
 
-    const run = async () => {
-      try {
-        // Spark renders all six faces of the splat scene into its internal
-        // WebGLCubeRenderTarget. `update: true` re-sorts gaussians around the
-        // capture position; `filter: false` keeps SRGBColorSpace + no mipmaps.
-        await spark.renderCubeMap({
-          scene,
-          worldCenter: capturePos,
-          size: FACE_SIZE,
-          update: true,
-          filter: false,
-          hideObjects: [],
-        })
+    // Preserve the scene camera's clip range when it is tighter/wider than the
+    // Spark defaults, so the captured faces match what the user sees.
+    const near =
+      camera instanceof THREE.PerspectiveCamera && camera.near > 0 ? camera.near : FACE_NEAR
+    const far =
+      camera instanceof THREE.PerspectiveCamera && camera.far > 0 ? camera.far : FACE_FAR
 
-        // Read all six faces back as RGBA byte buffers, in +X,-X,+Y,-Y,+Z,-Z
-        // order. This reads directly from Spark's cube render target — no need
-        // to hand-roll a fullscreen-quad pass per face.
-        const buffers = await spark.readCubeTargets()
+    const run = async () => {
+      // GL resources we create and must always dispose.
+      const renderTarget = new THREE.WebGLRenderTarget(FACE_SIZE, FACE_SIZE, {
+        format: THREE.RGBAFormat,
+        type: THREE.UnsignedByteType,
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        depthBuffer: true,
+        stencilBuffer: false,
+        generateMipmaps: false,
+      })
+      // SRGBColorSpace matches Spark's `filter:false` cube target so the bytes
+      // we read back carry the same gamma as the old renderCubeMap path.
+      renderTarget.texture.colorSpace = THREE.SRGBColorSpace
+
+      const renderer = spark.renderer
+      const priorRenderTarget = renderer.getRenderTarget()
+      // Disable Spark's per-frame auto-sort so the six sequential face renders
+      // don't each kick off an async sort + accumulator swap (the root cause of
+      // the empty-faces bug). `onBeforeRender` still runs and uploads each
+      // face camera's view matrix — it just skips re-sorting.
+      const priorAutoUpdate = spark.autoUpdate
+      const priorSortRadial = spark.sortRadial
+      spark.autoUpdate = false
+      spark.sortRadial = true
+
+      try {
+        // ONE radial gaussian sort around the capture point. The radial metric
+        // (distance from worldCenter) is direction-independent, so this single
+        // sort is valid for all six face directions. `update` awaits the async
+        // worker sort to completion before returning.
+        const sortCamera = new THREE.PerspectiveCamera(90, 1, near, far)
+        sortCamera.position.copy(capturePos)
+        sortCamera.lookAt(capturePos.x, capturePos.y, capturePos.z - 1)
+        sortCamera.updateMatrixWorld(true)
+        await spark.update({ scene, camera: sortCamera })
         if (cancelled) return
-        if (!buffers || buffers.length < FACE_ORDER.length) {
-          throw new Error(
-            `CubeCaptureController: expected ${FACE_ORDER.length} face buffers, got ${buffers?.length ?? 0}`,
-          )
-        }
 
         const faces = {} as CubeFaceUrls
         const facesBase64 = {} as CubeFaceUrls
-        for (let i = 0; i < FACE_ORDER.length; i++) {
-          const key = FACE_ORDER[i]
-          const dataUrl = rgbaBufferToPngDataUrl(buffers[i], FACE_SIZE)
+
+        for (const { key, look, up } of FACE_ORIENTATIONS) {
+          const faceCamera = new THREE.PerspectiveCamera(90, 1, near, far)
+          faceCamera.position.copy(capturePos)
+          faceCamera.up.set(up[0], up[1], up[2])
+          faceCamera.lookAt(
+            capturePos.x + look[0],
+            capturePos.y + look[1],
+            capturePos.z + look[2],
+          )
+          faceCamera.updateMatrixWorld(true)
+
+          // Render this face. Spark's `onBeforeRender` (autoUpdate off) uploads
+          // faceCamera's view matrix and the already-computed ordering texture,
+          // so the splat draws correctly ordered for this direction. We render
+          // twice: the first pass guarantees Spark's uniforms/ordering texture
+          // are bound to the GL state for this target; the second is the clean
+          // frame we read back.
+          renderer.setRenderTarget(renderTarget)
+          renderer.render(scene, faceCamera)
+          renderer.render(scene, faceCamera)
+
+          const buffer = new Uint8Array(FACE_SIZE * FACE_SIZE * 4)
+          await renderer.readRenderTargetPixelsAsync(
+            renderTarget,
+            0,
+            0,
+            FACE_SIZE,
+            FACE_SIZE,
+            buffer,
+          )
+          if (cancelled) return
+
+          const dataUrl = rgbaBufferToPngDataUrl(buffer, FACE_SIZE)
           faces[key] = dataUrl
           facesBase64[key] = stripDataUrlPrefix(dataUrl)
         }
@@ -202,6 +299,11 @@ export function CubeCaptureController({ slug, sparkRenderer }: Props) {
         // Drop back to idle so the UI isn't stuck in 'capturing'.
         setPhase('idle')
       } finally {
+        // Restore Spark's render state so the live viewport resumes normally.
+        spark.autoUpdate = priorAutoUpdate
+        spark.sortRadial = priorSortRadial
+        renderer.setRenderTarget(priorRenderTarget)
+        renderTarget.dispose()
         // Restore the user's prior viewer quality regardless of outcome.
         if (priorQuality !== ViewerQuality.High) {
           useDebugStore.getState().setViewerQuality(priorQuality)

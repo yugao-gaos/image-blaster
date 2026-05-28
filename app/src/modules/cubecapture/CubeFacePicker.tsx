@@ -15,10 +15,12 @@ import {
  * 'picking' phase.
  *
  * Renders the six captured cube faces in a standard unfolded cube-cross layout,
- * each wrapped in a <BlurOverlay> so the user sees the Laplacian heatmap + a
- * status badge ("ready" vs. "blur crosses edge"). The goal is to pick the single
- * face whose bad region is fully contained — inpainting one face in isolation
- * requires the blur not to spill across a cube-face edge.
+ * each wrapped in a <BlurOverlay> so the user sees the heatmap + a 3-way status
+ * badge: green "ready" / red "blurry · fixable" (real content — fix targets) vs.
+ * gray "empty · no data" (directions Marble had no source for). The usual goal is
+ * to pick a green/red face whose bad region is fully contained — inpainting one
+ * face in isolation requires the blur not to spill across a cube-face edge — but
+ * empty faces stay clickable for the "extend the world" use case.
  *
  * Clicking a face advances the store to 'masking' via selectFace(key); the close
  * button resets the store back to idle. Renders nothing unless phase==='picking'.
@@ -72,12 +74,15 @@ export function CubeFacePicker() {
             <h2 className="text-sm font-medium tracking-wide text-white/90">
               Pick the face with the bad region
             </h2>
-            <p className="mt-1 max-w-[28rem] text-xs leading-snug text-white/55">
-              Choose the single face whose blurry/low-structure area sits fully inside it. If a
-              face is flagged{' '}
-              <span className="text-red-300">blur crosses edge</span>, the bad region spills onto a
-              neighbor — reposition and re-capture so it lands{' '}
-              <span className="text-emerald-300">ready</span> inside one face.
+            <p className="mt-1 max-w-[30rem] text-xs leading-snug text-white/55">
+              <span className="text-emerald-300">Ready</span> (green) and{' '}
+              <span className="text-red-300">blurry · fixable</span> (red) faces have real content —
+              those are the fix targets. <span className="text-zinc-300">Empty · no data</span>{' '}
+              (gray) faces are directions Marble had no source for; you can still pick one to{' '}
+              <em>extend</em> the world, but it isn&apos;t a blur fix. For a fix, choose the face
+              whose bad area sits fully inside it — if it&apos;s flagged{' '}
+              <span className="text-red-300">blur crosses edge</span> the region spills onto a
+              neighbor, so reposition and re-capture.
             </p>
           </div>
           <AppButton
@@ -99,18 +104,23 @@ export function CubeFacePicker() {
           {CROSS_CELLS.map(({ key, label, col, row }) => {
             const faceUrl = cubeFaceUrls[key]
             const result = results[key]
-            const crossesEdge = result?.crossesEdge ?? false
+            // Border keys off the 3-way quality: gray = empty (no data),
+            // amber/red = blurry (fixable, fix target), green = ready. Falls
+            // back to neutral until the face finishes analyzing.
+            let borderClass = 'border-white/15 hover:border-white/40'
+            if (result?.quality === 'empty')
+              borderClass = 'border-zinc-500/50 hover:border-zinc-400'
+            else if (result?.quality === 'blurry')
+              borderClass = 'border-red-400/60 hover:border-red-300'
+            else if (result?.quality === 'ready')
+              borderClass = 'border-emerald-400/50 hover:border-emerald-300'
             return (
               <button
                 key={key}
                 type="button"
                 onClick={() => selectFace(key)}
                 title={`Select ${label}`}
-                className={`group flex flex-col items-stretch gap-1 rounded border bg-black/40 p-1 text-left transition-[border-color,background-color] hover:bg-white/10 focus:outline-none focus-visible:ring-1 focus-visible:ring-white/60 ${
-                  crossesEdge
-                    ? 'border-red-400/60 hover:border-red-300'
-                    : 'border-white/15 hover:border-white/40'
-                }`}
+                className={`group flex flex-col items-stretch gap-1 rounded border bg-black/40 p-1 text-left transition-[border-color,background-color] hover:bg-white/10 focus:outline-none focus-visible:ring-1 focus-visible:ring-white/60 ${borderClass}`}
                 style={{ gridColumnStart: col, gridRowStart: row }}
               >
                 <div className="overflow-hidden rounded">

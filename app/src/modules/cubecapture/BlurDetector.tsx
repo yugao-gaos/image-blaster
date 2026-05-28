@@ -26,13 +26,31 @@ export interface NormalizedBBox {
   h: number
 }
 
+/**
+ * Three-way face classification.
+ *
+ * The key insight (from real Marble captures off a single non-pano plate): the
+ * directions Marble had no source data for come back as near-uniform flat-color
+ * fills — they're *empty*, not blurry. They have NO data, so they're a candidate
+ * to extend/fill (or skip), never to inpaint+re-Marble. A *blurry* face has real
+ * (varied) content that's just degraded/hallucinated — that's the inpaint
+ * candidate. A *ready* face has crisp structure throughout.
+ */
+export type FaceQuality = 'empty' | 'blurry' | 'ready'
+
 export interface BlurMapResult {
-  /** Transparent PNG data URL with low-structure windows painted translucent red. Same aspect as the analysis canvas. */
+  /** Transparent PNG data URL with blurry windows painted translucent red and empty windows neutral gray. Same aspect as the analysis canvas. */
   heatmapDataUrl: string
   /** Bounding box of the largest low-structure cluster, in normalized 0..1 face coords, or null if negligible. */
   blurBBox: NormalizedBBox | null
   /** Fraction (0..1) of windows flagged as low-structure. */
   lowStructureRatio: number
+  /** Three-way classification: 'empty' (no data) | 'blurry' (fixable) | 'ready'. */
+  quality: FaceQuality
+  /** Mean Rec.601 luma (0..255) over the downscaled face. */
+  meanLuminance: number
+  /** Global variance of Rec.601 luma over the downscaled face. */
+  luminanceVariance: number
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +76,25 @@ const STRUCTURE_THRESHOLD = 12
 const NEGLIGIBLE_RATIO = 0.02
 /** Margin (in normalized coords) within which a bbox edge counts as touching a face edge. */
 const EDGE_MARGIN = 0.04
+
+/**
+ * Global luma-variance cutoff for "empty" (no-data) faces. A face Marble had no
+ * source for is a near-uniform flat fill, so its luma variance collapses toward
+ * zero. Real interior content — even out-of-focus content — has wide luma spread
+ * (shadows, highlights, color blocks) and sits orders of magnitude higher (often
+ * thousands). 150 (≈ stddev 12 on a 0..255 scale) cleanly separates a flat
+ * 77–102 KB PNG from a detailed 1.5 MB interior without catching low-contrast-
+ * but-real surfaces. Empty is decided on variance alone, regardless of mean
+ * (the flat color can be black, white, sky, etc.).
+ */
+const EMPTY_VARIANCE_THRESHOLD = 150
+/**
+ * Low-structure fraction above which a *non-empty* face is called "blurry".
+ * If more than ~35% of windows lack Laplacian structure yet the face has real
+ * luma variation, the content is degraded/hallucinated mush — the inpaint
+ * candidate. Below this it's treated as 'ready' (enough crisp structure).
+ */
+const BLURRY_RATIO_THRESHOLD = 0.35
 
 // ---------------------------------------------------------------------------
 // Pure analysis
@@ -118,9 +155,11 @@ function offscreenToDataURL(off: OffscreenCanvas): string {
  *     [0 -1 0; -1 4 -1; 0 -1 0] per pixel, take the squared magnitude.
  *  3. Average the squared Laplacian over non-overlapping 16×16 windows
  *     → a 16×16 grid of "structure scores".
- *  4. Flag windows whose score < STRUCTURE_THRESHOLD as low-structure (blurry);
- *     paint them translucent red onto a transparent heatmap canvas.
- *  5. Bounding box = bbox of the largest connected (4-neighbor) cluster of
+ *  4. Flag windows whose score < STRUCTURE_THRESHOLD as low-structure.
+ *  5. Classify the face (empty/blurry/ready) from global luma variance + the
+ *     flagged fraction, then paint the heatmap: gray wash for empty (no-data),
+ *     translucent red windows for blurry/ready low-structure regions.
+ *  6. Bounding box = bbox of the largest connected (4-neighbor) cluster of
  *     flagged windows, normalized to 0..1; null if the flagged fraction is
  *     negligible.
  */
@@ -131,11 +170,19 @@ export async function computeBlurMap(imageDataUrl: string): Promise<BlurMapResul
   ctx.drawImage(img, 0, 0, ANALYSIS_SIZE, ANALYSIS_SIZE)
   const { data } = ctx.getImageData(0, 0, ANALYSIS_SIZE, ANALYSIS_SIZE)
 
-  // 1. Luminance (Rec. 601) per pixel.
+  // 1. Luminance (Rec. 601) per pixel, accumulating global mean/variance.
   const lum = new Float32Array(ANALYSIS_SIZE * ANALYSIS_SIZE)
+  let lumSum = 0
+  let lumSumSq = 0
   for (let i = 0, p = 0; i < lum.length; i++, p += 4) {
-    lum[i] = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2]
+    const l = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2]
+    lum[i] = l
+    lumSum += l
+    lumSumSq += l * l
   }
+  const meanLuminance = lumSum / lum.length
+  // Population variance: E[L²] - E[L]².
+  const luminanceVariance = lumSumSq / lum.length - meanLuminance * meanLuminance
 
   // 2. Squared Laplacian per pixel (skip the 1px border; treat it as 0).
   const sqLap = new Float32Array(ANALYSIS_SIZE * ANALYSIS_SIZE)
@@ -175,23 +222,42 @@ export async function computeBlurMap(imageDataUrl: string): Promise<BlurMapResul
   }
   const lowStructureRatio = flaggedCount / (GRID * GRID)
 
+  // 5. Three-way classification.
+  //  - 'empty':  near-uniform luma (no-data direction) → variance below cutoff,
+  //              regardless of mean. These faces have NO content to fix.
+  //  - 'blurry': real luma variation but mostly low-structure → degraded content,
+  //              the inpaint candidate.
+  //  - 'ready':  enough crisp Laplacian structure across the face.
+  let quality: FaceQuality
+  if (luminanceVariance < EMPTY_VARIANCE_THRESHOLD) quality = 'empty'
+  else if (lowStructureRatio >= BLURRY_RATIO_THRESHOLD) quality = 'blurry'
+  else quality = 'ready'
+
+  // 6. Heatmap. Empty faces get a neutral gray wash (no-data, nothing to fix);
+  //    blurry/ready faces keep the red low-structure overlay so the two read
+  //    differently at a glance.
   const heat = makeCanvas(ANALYSIS_SIZE)
   heat.ctx.clearRect(0, 0, ANALYSIS_SIZE, ANALYSIS_SIZE)
-  heat.ctx.fillStyle = 'rgba(255, 40, 40, 0.45)'
-  for (let gy = 0; gy < GRID; gy++) {
-    for (let gx = 0; gx < GRID; gx++) {
-      if (flagged[gy * GRID + gx]) {
-        heat.ctx.fillRect(gx * WINDOW, gy * WINDOW, WINDOW, WINDOW)
+  if (quality === 'empty') {
+    heat.ctx.fillStyle = 'rgba(140, 140, 150, 0.40)'
+    heat.ctx.fillRect(0, 0, ANALYSIS_SIZE, ANALYSIS_SIZE)
+  } else {
+    heat.ctx.fillStyle = 'rgba(255, 40, 40, 0.45)'
+    for (let gy = 0; gy < GRID; gy++) {
+      for (let gx = 0; gx < GRID; gx++) {
+        if (flagged[gy * GRID + gx]) {
+          heat.ctx.fillRect(gx * WINDOW, gy * WINDOW, WINDOW, WINDOW)
+        }
       }
     }
   }
   const heatmapDataUrl = heat.toDataURL()
 
-  // 5. Largest connected cluster bbox (4-neighbor flood fill over the grid).
+  // 7. Largest connected cluster bbox (4-neighbor flood fill over the grid).
   const blurBBox =
     lowStructureRatio < NEGLIGIBLE_RATIO ? null : largestClusterBBox(flagged, GRID)
 
-  return { heatmapDataUrl, blurBBox, lowStructureRatio }
+  return { heatmapDataUrl, blurBBox, lowStructureRatio, quality, meanLuminance, luminanceVariance }
 }
 
 /**
@@ -286,8 +352,9 @@ export interface BlurOverlayProps {
 
 /**
  * Renders a face thumbnail with the Laplacian-variance heatmap layered on top,
- * plus a small status badge ("ready" vs. "blur crosses edge"). Kept deliberately
- * minimal — the CubeFacePicker composes six of these in its cross layout.
+ * plus a 3-way status badge: gray "empty · no data" | red "blurry · fixable"
+ * (or "blur crosses edge") | green "ready". Kept deliberately minimal — the
+ * CubeFacePicker composes six of these in its cross layout.
  */
 export function BlurOverlay({ faceUrl, size = 160, className, onResult }: BlurOverlayProps) {
   const [result, setResult] = useState<BlurMapResult | null>(null)
@@ -315,14 +382,18 @@ export function BlurOverlay({ faceUrl, size = 160, className, onResult }: BlurOv
   }, [faceUrl])
 
   const crossesEdge = result ? bboxCrossesFaceEdge(result.blurBBox) : false
-  const hasBlur = !!result?.blurBBox
 
   let badge: { label: string; color: string }
   if (error) badge = { label: 'error', color: 'rgba(120,120,120,0.85)' }
   else if (!result) badge = { label: 'analyzing…', color: 'rgba(120,120,120,0.85)' }
-  else if (crossesEdge) badge = { label: 'blur crosses edge', color: 'rgba(220,60,60,0.9)' }
-  else if (hasBlur) badge = { label: 'ready', color: 'rgba(60,170,90,0.9)' }
-  else badge = { label: 'clear', color: 'rgba(60,120,170,0.9)' }
+  // 'empty' (no data) reads gray; 'blurry' (fixable) reads red and still surfaces
+  // the crosses-edge caveat; 'ready' reads green.
+  else if (result.quality === 'empty') badge = { label: 'empty · no data', color: 'rgba(120,124,135,0.92)' }
+  else if (result.quality === 'blurry')
+    badge = crossesEdge
+      ? { label: 'blur crosses edge', color: 'rgba(220,60,60,0.9)' }
+      : { label: 'blurry · fixable', color: 'rgba(220,60,60,0.9)' }
+  else badge = { label: 'ready', color: 'rgba(60,170,90,0.9)' }
 
   return (
     <div
