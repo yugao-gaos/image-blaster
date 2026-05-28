@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { XIcon } from '@phosphor-icons/react'
+import { CrosshairSimpleIcon, XIcon } from '@phosphor-icons/react'
 import { AppButton } from '../../components/AppButton'
 import { ChromePanel } from '../../components/AppChrome'
 import { BlurOverlay, type BlurMapResult } from './BlurDetector'
@@ -12,6 +12,7 @@ import {
   type CubeFaceKey,
   type CubeFaceUrls,
 } from './useCubeCapture'
+import type { Vec3Tuple } from '../../types/world'
 
 /**
  * CubeFacePicker — modal overlay shown while the capture store is in the
@@ -39,12 +40,31 @@ import {
 /** One capture set as returned by GET /__cube-captures. */
 interface CaptureSetSummary {
   captureIndex: number
+  /** Camera position where this capture was taken, for snapping back. May be
+   *  null for older captures recorded before positions were persisted. */
+  capturePosition: Vec3Tuple | null
   faceUrls: CubeFaceUrls
   inpaintedFaces: Partial<Record<CubeFaceKey, string>>
 }
 
 /** Size (px) of each face cell in the cross layout. */
 const FACE_SIZE = 144
+
+/**
+ * Coerce an unknown JSON value into a Vec3Tuple, or null if it isn't a
+ * length-3 array of finite numbers. Guards against missing/legacy
+ * `capturePosition` fields in the /__cube-captures response.
+ */
+function toVec3Tuple(value: unknown): Vec3Tuple | null {
+  if (
+    Array.isArray(value) &&
+    value.length === 3 &&
+    value.every((n) => typeof n === 'number' && Number.isFinite(n))
+  ) {
+    return value as Vec3Tuple
+  }
+  return null
+}
 
 /**
  * Cube-cross grid placement. A standard unfolded cube on a 4-wide × 3-tall grid:
@@ -75,6 +95,7 @@ export function CubeFacePicker({ slug }: { slug: string }) {
   const selectFace = useCubeCapture((s) => s.selectFace)
   const proceedToMarble = useCubeCapture((s) => s.proceedToMarble)
   const reopenCapture = useCubeCapture((s) => s.reopenCapture)
+  const setCameraSnapTarget = useCubeCapture((s) => s.setCameraSnapTarget)
   const reset = useCubeCapture((s) => s.reset)
 
   // Per-face containment state, populated as each BlurOverlay finishes analysis.
@@ -91,8 +112,17 @@ export function CubeFacePicker({ slug }: { slug: string }) {
     let cancelled = false
     fetch(`/__cube-captures?slug=${encodeURIComponent(slug)}`)
       .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
-      .then((data: CaptureSetSummary[]) => {
-        if (!cancelled) setCaptureSets(Array.isArray(data) ? data : [])
+      .then((data: unknown) => {
+        if (cancelled) return
+        // Normalize each row, coercing capturePosition into a valid Vec3Tuple
+        // or null (older captures predate persisted positions).
+        const list = Array.isArray(data)
+          ? (data as CaptureSetSummary[]).map((set) => ({
+              ...set,
+              capturePosition: toVec3Tuple((set as { capturePosition?: unknown }).capturePosition),
+            }))
+          : []
+        setCaptureSets(list)
       })
       .catch(() => {
         if (!cancelled) setCaptureSets([])
@@ -160,14 +190,15 @@ export function CubeFacePicker({ slug }: { slug: string }) {
                 {captureSets.map((set) => {
                   const active = set.captureIndex === captureIndex
                   const count = Object.keys(set.inpaintedFaces ?? {}).length
+                  const canSnap = set.capturePosition !== null
                   return (
-                    <li key={set.captureIndex}>
+                    <li key={set.captureIndex} className="flex items-stretch gap-1">
                       <button
                         type="button"
-                        onClick={() =>
+                        onClick={() => {
                           reopenCapture(
                             set.captureIndex,
-                            null,
+                            set.capturePosition,
                             set.faceUrls,
                             // Server returns a bare inpainted URL per face; the
                             // store wants { inpaintedUrl } (mask is reloaded on
@@ -179,15 +210,18 @@ export function CubeFacePicker({ slug }: { slug: string }) {
                               ]),
                             ),
                           )
-                        }
+                          // Fly the viewer camera back to where this capture was
+                          // taken so the picked face lines up with the vantage.
+                          if (set.capturePosition) setCameraSnapTarget(set.capturePosition)
+                        }}
                         aria-current={active ? 'true' : undefined}
-                        className={`flex w-full items-center justify-between gap-2 rounded border px-2 py-1.5 text-left text-[11px] transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-white/60 ${
+                        className={`flex min-w-0 flex-1 items-center justify-between gap-2 rounded border px-2 py-1.5 text-left text-[11px] transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-white/60 ${
                           active
                             ? 'border-sky-400/60 bg-sky-400/15 text-white'
                             : 'border-white/10 bg-black/30 text-white/65 hover:border-white/30 hover:bg-white/5'
                         }`}
                       >
-                        <span className="font-medium">Capture #{set.captureIndex}</span>
+                        <span className="truncate font-medium">Capture #{set.captureIndex}</span>
                         <span
                           className={`tabular-nums ${count > 0 ? 'text-emerald-300' : 'text-white/35'}`}
                           title={`${count} face(s) inpainted`}
@@ -195,6 +229,20 @@ export function CubeFacePicker({ slug }: { slug: string }) {
                           {count}✓
                         </span>
                       </button>
+                      {/* Standalone snap-to-vantage: flies the camera to this
+                          capture's position without reopening it. Hidden when the
+                          capture has no recorded position. */}
+                      {canSnap && (
+                        <button
+                          type="button"
+                          onClick={() => setCameraSnapTarget(set.capturePosition)}
+                          aria-label={`Snap camera to capture #${set.captureIndex}`}
+                          title="Snap camera to capture"
+                          className="flex w-7 flex-shrink-0 items-center justify-center rounded border border-white/10 bg-black/30 text-white/55 transition-colors hover:border-sky-400/50 hover:bg-sky-400/15 hover:text-sky-200 focus:outline-none focus-visible:ring-1 focus-visible:ring-white/60"
+                        >
+                          <CrosshairSimpleIcon size={14} weight="bold" />
+                        </button>
+                      )}
                     </li>
                   )
                 })}

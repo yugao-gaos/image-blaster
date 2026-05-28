@@ -3,6 +3,7 @@ import { useFrame, useThree } from '@react-three/fiber'
 import { RigidBody, CapsuleCollider, useRapier } from '@react-three/rapier'
 import * as THREE from 'three'
 import { useCameraGestures } from '../camera/useCameraGestures'
+import { pendingCameraSnap } from '../camera/cameraFocus'
 import { useDebugStore } from '../../store/debug'
 import { isEditableTarget } from '../../utils/dom'
 import {
@@ -165,6 +166,17 @@ export const CharacterController = forwardRef<CharacterControllerHandle>(
   useFrame((_state, delta) => {
     const body = bodyRef.current
     if (!body) return
+
+    // Honor an external camera snap (CameraSnapController): teleport the body so
+    // the camera-sync below lands at the snapped world position instead of
+    // overwriting it from the body's stale translation.
+    const snap = pendingCameraSnap.current
+    if (snap) {
+      body.setTranslation({ x: snap.x, y: snap.y - CAMERA_EYE_OFFSET, z: snap.z }, true)
+      body.setLinvel({ x: 0, y: 0, z: 0 }, true)
+      body.wakeUp()
+      pendingCameraSnap.current = null
+    }
 
     const smoothing = 1 - Math.pow(1 - MOUSE_SMOOTHING, delta * 60)
     smoothYaw.current += (rawYaw.current - smoothYaw.current) * smoothing

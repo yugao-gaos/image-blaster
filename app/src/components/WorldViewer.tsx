@@ -11,6 +11,8 @@ import { CubeCaptureController } from '../modules/cubecapture/CubeCaptureControl
 import { CubeFacePicker } from '../modules/cubecapture/CubeFacePicker'
 import { MaskPainter } from '../modules/cubecapture/MaskPainter'
 import { MarbleModePicker } from '../modules/cubecapture/MarbleModePicker'
+import { InpaintReview } from '../modules/cubecapture/InpaintReview'
+import { CameraSnapController } from '../modules/cubecapture/CameraSnapController'
 import { EnvironmentMap } from '../modules/environment/EnvironmentMap'
 import { WorldCollider } from '../modules/collider/WorldCollider'
 import { GroundPlane } from '../modules/collider/GroundPlane'
@@ -323,6 +325,7 @@ export function WorldViewer({
           {editing && (
             <CubeCaptureController slug={desiredSlug} sparkRenderer={sparkRendererRef} />
           )}
+          {editing && <CameraSnapController />}
           <directionalLight
             castShadow={isHighQuality && activeSunIntensity > 0}
             color={sunColor}
@@ -368,6 +371,7 @@ export function WorldViewer({
         <>
           <CubeFacePicker slug={desiredSlug} />
           <MaskPainter slug={desiredSlug} />
+          <InpaintReview />
           <MarbleModePicker slug={desiredSlug} marbleSeed={marbleSeed} />
         </>
       )}

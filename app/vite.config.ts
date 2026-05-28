@@ -985,6 +985,14 @@ function worldsPlugin(): Plugin {
             buffers[key] = decoded
           }
 
+          const rawPosition = body.capturePosition
+          const capturePosition =
+            Array.isArray(rawPosition) &&
+            rawPosition.length === 3 &&
+            rawPosition.every((value) => typeof value === 'number' && Number.isFinite(value))
+              ? ([rawPosition[0], rawPosition[1], rawPosition[2]] as [number, number, number])
+              : null
+
           const captureIndex = nextCubeCaptureIndex(dir)
           fs.mkdirSync(dir, { recursive: true })
           const faceUrls: Record<string, string> = {}
@@ -994,8 +1002,21 @@ function worldsPlugin(): Plugin {
             faceUrls[key] = cubeWorldUrl(slug, fileName)
           }
 
+          // Visible sidecar JSON (not a hidden request sidecar) so the UI can snap
+          // the camera back to where this capture was taken. The `.json` name does
+          // not match the face/index regexes, so it never counts as a face.
+          const sidecarName = `cube-capture-${captureIndex}.json`
+          fs.writeFileSync(
+            path.join(dir, sidecarName),
+            JSON.stringify(
+              { captureIndex, capturePosition, createdAt: new Date().toISOString() },
+              null,
+              2,
+            ),
+          )
+
           res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify({ captureIndex, faceUrls }))
+          res.end(JSON.stringify({ captureIndex, capturePosition, faceUrls }))
         }, () => {
           res.statusCode = 400
           res.end('Invalid JSON')
@@ -1070,7 +1091,28 @@ function worldsPlugin(): Plugin {
                 if (url) inpainted[key] = url
               }
             }
-            return { captureIndex, faceUrls, inpaintedFaces: inpainted }
+            // Defensively read the visible sidecar to recover the camera position.
+            let capturePosition: [number, number, number] | null = null
+            try {
+              const sidecarPath = path.join(dir, `cube-capture-${captureIndex}.json`)
+              if (fs.existsSync(sidecarPath)) {
+                const sidecar = JSON.parse(fs.readFileSync(sidecarPath, 'utf-8')) as unknown
+                const raw =
+                  sidecar && typeof sidecar === 'object'
+                    ? (sidecar as Record<string, unknown>).capturePosition
+                    : null
+                if (
+                  Array.isArray(raw) &&
+                  raw.length === 3 &&
+                  raw.every((value) => typeof value === 'number' && Number.isFinite(value))
+                ) {
+                  capturePosition = [raw[0], raw[1], raw[2]] as [number, number, number]
+                }
+              }
+            } catch {
+              capturePosition = null
+            }
+            return { captureIndex, capturePosition, faceUrls, inpaintedFaces: inpainted }
           })
 
         res.end(JSON.stringify(captures))

@@ -41,8 +41,8 @@ export function MaskPainter({ slug }: Props) {
   const cubeFaceUrls = useCubeCapture((s: CubeCaptureStore) => s.cubeFaceUrls)
   const captureIndex = useCubeCapture((s: CubeCaptureStore) => s.captureIndex)
   const setMask = useCubeCapture((s: CubeCaptureStore) => s.setMask)
-  const recordInpainted = useCubeCapture(
-    (s: CubeCaptureStore) => s.recordInpainted,
+  const reviewInpaint = useCubeCapture(
+    (s: CubeCaptureStore) => s.reviewInpaint,
   )
   const setPhase = useCubeCapture((s: CubeCaptureStore) => s.setPhase)
   const reset = useCubeCapture((s: CubeCaptureStore) => s.reset)
@@ -194,9 +194,9 @@ export function MaskPainter({ slug }: Props) {
       if (!result?.inpaintedUrl) {
         throw new Error('/__cube-inpaint returned no inpaintedUrl')
       }
-      // Record this face's result and return to the picker (recordInpainted
-      // sets phase back to 'picking') so the user can inpaint another face.
-      recordInpainted(selectedFace, maskDataUrl, result.inpaintedUrl)
+      // Stage the result for review (reviewInpaint sets phase to 'reviewing')
+      // so the user can compare before/after and accept, discard, or remask.
+      reviewInpaint(selectedFace, maskDataUrl, result.inpaintedUrl)
     } catch (err) {
       console.error('MaskPainter: inpaint failed', err)
       setError(err instanceof Error ? err.message : 'inpaint failed')
@@ -208,7 +208,7 @@ export function MaskPainter({ slug }: Props) {
   }, [
     captureIndex,
     prompt,
-    recordInpainted,
+    reviewInpaint,
     selectedFace,
     setMask,
     setPhase,
@@ -286,9 +286,21 @@ export function MaskPainter({ slug }: Props) {
         )}
 
         <div className="flex items-center justify-between gap-2">
-          <AppButton onClick={reset} disabled={submitting}>
-            cancel
-          </AppButton>
+          <div className="flex items-center gap-1">
+            <AppButton
+              onClick={() => setPhase('picking')}
+              disabled={submitting}
+            >
+              ← back to faces
+            </AppButton>
+            <AppButton
+              onClick={reset}
+              disabled={submitting}
+              title="close capture flow"
+            >
+              ✕
+            </AppButton>
+          </div>
           <div className="flex items-center gap-1">
             <AppButton onClick={clearMask} disabled={submitting || !hasStrokes}>
               clear
