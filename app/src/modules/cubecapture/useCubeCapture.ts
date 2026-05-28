@@ -5,9 +5,14 @@ import type { Vec3Tuple } from '../../types/world'
  * Cube-capture feature state machine.
  *
  * Flow (see plan "capture path"): the user walks the splat, captures a cube at
- * their current position, picks the single bad face, paints a mask, inpaints it,
- * chooses a Marble input mode (equirect stitch vs. 4 cardinal multi-image), then
- * re-Marbles into a patch world that gets placed/anchored back in the scene.
+ * their current position, then iteratively fixes faces — for each face they pick
+ * it, paint a mask, inpaint, and return to the picker. Multiple faces of the same
+ * capture can be inpainted; completed results accumulate in `inpaintedFaces` keyed
+ * by face. Once at least one face is done the user proceeds to choose a Marble input
+ * mode (equirect stitch vs. 4 cardinal multi-image), then re-Marbles into a patch
+ * world that gets placed/anchored back in the scene. Prior capture sets can be
+ * reloaded from disk (via GET /__cube-captures) with `reopenCapture` to revisit and
+ * inpaint additional faces.
  */
 export type CubeCapturePhase =
   | 'idle'
@@ -32,6 +37,12 @@ export type MarbleInputMode = 'equirect' | 'multi-image'
 /** The four cardinal faces keyed by azimuth for the multi-image Marble path. */
 export type MultiImageUrls = Record<'az0' | 'az90' | 'az180' | 'az270', string>
 
+/** A completed inpaint result for a single face. */
+export interface InpaintedFace {
+  maskDataUrl: string
+  inpaintedUrl: string
+}
+
 interface CubeCaptureState {
   phase: CubeCapturePhase
   captureIndex: number | null
@@ -39,7 +50,8 @@ interface CubeCaptureState {
   cubeFaceUrls: CubeFaceUrls | null
   selectedFace: CubeFaceKey | null
   maskDataUrl: string | null
-  inpaintedUrl: string | null
+  /** Completed inpaint results, keyed by the face they replace. */
+  inpaintedFaces: Partial<Record<CubeFaceKey, InpaintedFace>>
   marbleInputMode: MarbleInputMode | null
   equirectUrl: string | null
   multiImageUrls: MultiImageUrls | null
@@ -53,7 +65,17 @@ interface CubeCaptureActions {
   /** Selects the bad face to inpaint and advances to masking. */
   selectFace: (face: CubeFaceKey) => void
   setMask: (maskDataUrl: string | null) => void
-  setInpainted: (inpaintedUrl: string | null) => void
+  /** Records a completed inpaint for one face, clears the in-progress face/mask, and returns to the picker for another face. */
+  recordInpainted: (face: CubeFaceKey, maskDataUrl: string, inpaintedUrl: string) => void
+  /** Advances to Marble mode picking once at least one face has been inpainted. */
+  proceedToMarble: () => void
+  /** Reloads a prior capture set (from disk) back into the store and returns to the picker. */
+  reopenCapture: (
+    index: number,
+    position: Vec3Tuple | null,
+    faceUrls: CubeFaceUrls,
+    inpaintedFaces: Partial<Record<CubeFaceKey, { maskDataUrl?: string; inpaintedUrl: string }>>,
+  ) => void
   setMode: (mode: MarbleInputMode | null) => void
   setEquirect: (equirectUrl: string | null) => void
   setMultiImage: (multiImageUrls: MultiImageUrls | null) => void
@@ -73,7 +95,7 @@ const initialState: CubeCaptureState = {
   cubeFaceUrls: null,
   selectedFace: null,
   maskDataUrl: null,
-  inpaintedUrl: null,
+  inpaintedFaces: {},
   marbleInputMode: null,
   equirectUrl: null,
   multiImageUrls: null,
@@ -84,10 +106,31 @@ export const useCubeCapture = create<CubeCaptureStore>((set) => ({
   ...initialState,
   setPhase: (phase) => set({ phase }),
   setCaptureResult: (index, faceUrls) =>
-    set({ captureIndex: index, cubeFaceUrls: faceUrls, phase: 'picking' }),
+    set({ captureIndex: index, cubeFaceUrls: faceUrls, inpaintedFaces: {}, phase: 'picking' }),
   selectFace: (face) => set({ selectedFace: face, phase: 'masking' }),
   setMask: (maskDataUrl) => set({ maskDataUrl }),
-  setInpainted: (inpaintedUrl) => set({ inpaintedUrl }),
+  recordInpainted: (face, maskDataUrl, inpaintedUrl) =>
+    set((s) => ({
+      inpaintedFaces: { ...s.inpaintedFaces, [face]: { maskDataUrl, inpaintedUrl } },
+      selectedFace: null,
+      maskDataUrl: null,
+      phase: 'picking',
+    })),
+  proceedToMarble: () => set({ phase: 'mode-picking' }),
+  reopenCapture: (index, position, faceUrls, inpaintedFaces) =>
+    set({
+      ...initialState,
+      captureIndex: index,
+      capturePosition: position,
+      cubeFaceUrls: faceUrls,
+      inpaintedFaces: Object.fromEntries(
+        Object.entries(inpaintedFaces).map(([face, entry]) => [
+          face,
+          { maskDataUrl: entry?.maskDataUrl ?? '', inpaintedUrl: entry!.inpaintedUrl },
+        ]),
+      ) as Partial<Record<CubeFaceKey, InpaintedFace>>,
+      phase: 'picking',
+    }),
   setMode: (marbleInputMode) => set({ marbleInputMode }),
   setEquirect: (equirectUrl) => set({ equirectUrl }),
   setMultiImage: (multiImageUrls) => set({ multiImageUrls }),
@@ -104,7 +147,7 @@ export const selectCapturePosition = (s: CubeCaptureStore) => s.capturePosition
 export const selectCubeFaceUrls = (s: CubeCaptureStore) => s.cubeFaceUrls
 export const selectSelectedFace = (s: CubeCaptureStore) => s.selectedFace
 export const selectMaskDataUrl = (s: CubeCaptureStore) => s.maskDataUrl
-export const selectInpaintedUrl = (s: CubeCaptureStore) => s.inpaintedUrl
+export const selectInpaintedFaces = (s: CubeCaptureStore) => s.inpaintedFaces
 export const selectMarbleInputMode = (s: CubeCaptureStore) => s.marbleInputMode
 export const selectEquirectUrl = (s: CubeCaptureStore) => s.equirectUrl
 export const selectMultiImageUrls = (s: CubeCaptureStore) => s.multiImageUrls

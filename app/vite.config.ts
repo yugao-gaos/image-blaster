@@ -1002,6 +1002,80 @@ function worldsPlugin(): Plugin {
         })
       })
 
+      // GET /__cube-captures?slug=<slug> — list every complete cube capture set on disk,
+      // grouped by index, including any inpainted faces, so the UI can reopen prior sets.
+      server.middlewares.use('/__cube-captures', (req, res) => {
+        res.setHeader('Cache-Control', 'no-store')
+        if (req.method && req.method !== 'GET') {
+          res.statusCode = 405
+          res.end('Method not allowed')
+          return
+        }
+        const requestUrl = new URL(req.url || '/', 'http://localhost')
+        const slug = requestUrl.searchParams.get('slug')
+        if (!slug) {
+          res.statusCode = 400
+          res.end('Missing slug')
+          return
+        }
+        const dir = outputWorldDir(slug)
+        if (!dir) {
+          res.statusCode = 400
+          res.end('Invalid slug')
+          return
+        }
+
+        res.setHeader('Content-Type', 'application/json')
+        if (!fs.existsSync(dir)) {
+          res.end(JSON.stringify([]))
+          return
+        }
+
+        type FaceKey = (typeof CUBE_FACE_KEYS)[number]
+        const baseFaces = new Map<number, Map<FaceKey, string>>()
+        const inpaintedFaces = new Map<number, Map<FaceKey, string>>()
+        const facePattern = CUBE_FACE_KEYS.join('|')
+        const baseRe = new RegExp(`^cube-capture-(\\d+)-(${facePattern})\\.png$`)
+        const inpaintRe = new RegExp(`^cube-capture-(\\d+)-(${facePattern})-inpainted\\.png$`)
+
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          if (!entry.isFile()) continue
+          const inpaintMatch = inpaintRe.exec(entry.name)
+          if (inpaintMatch) {
+            const index = Number(inpaintMatch[1])
+            const face = inpaintMatch[2] as FaceKey
+            if (!inpaintedFaces.has(index)) inpaintedFaces.set(index, new Map())
+            inpaintedFaces.get(index)!.set(face, cubeWorldUrl(slug, entry.name))
+            continue
+          }
+          const baseMatch = baseRe.exec(entry.name)
+          if (!baseMatch) continue
+          const index = Number(baseMatch[1])
+          const face = baseMatch[2] as FaceKey
+          if (!baseFaces.has(index)) baseFaces.set(index, new Map())
+          baseFaces.get(index)!.set(face, cubeWorldUrl(slug, entry.name))
+        }
+
+        const captures = [...baseFaces.entries()]
+          .filter(([, faces]) => CUBE_FACE_KEYS.every((key) => faces.has(key)))
+          .sort(([a], [b]) => a - b)
+          .map(([captureIndex, faces]) => {
+            const faceUrls = {} as Record<FaceKey, string>
+            for (const key of CUBE_FACE_KEYS) faceUrls[key] = faces.get(key)!
+            const inpainted = {} as Partial<Record<FaceKey, string>>
+            const inpaintedForIndex = inpaintedFaces.get(captureIndex)
+            if (inpaintedForIndex) {
+              for (const key of CUBE_FACE_KEYS) {
+                const url = inpaintedForIndex.get(key)
+                if (url) inpainted[key] = url
+              }
+            }
+            return { captureIndex, faceUrls, inpaintedFaces: inpainted }
+          })
+
+        res.end(JSON.stringify(captures))
+      })
+
       // POST /__cube-inpaint?slug=<slug>&captureIndex=<n>&faceKey=<key>
       // Writes the mask, then runs inpaint-cube-face.mjs synchronously (Marble-independent).
       server.middlewares.use('/__cube-inpaint', (req, res) => {

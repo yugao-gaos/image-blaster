@@ -12,9 +12,8 @@ import { cubeToEquirect } from './CubeToEquirect'
 import { cubeToMultiImage } from './CubeToMultiImage'
 import {
   selectCubeFaceUrls,
-  selectInpaintedUrl,
+  selectInpaintedFaces,
   selectPhase,
-  selectSelectedFace,
   useCubeCapture,
   type CubeFaceKey,
   type CubeFaceUrls,
@@ -84,23 +83,29 @@ async function urlToBase64(url: string): Promise<string> {
 
 type MarbleResponse = { pendingWorldIndex: number }
 
+/** The 4 horizontal cube faces used by the multi-image Marble path. */
+const CARDINAL_FACE_KEYS: CubeFaceKey[] = ['px', 'nx', 'pz', 'nz']
+
 /**
  * Build the faces object used by both Marble paths: clone the captured faces and
- * substitute the inpainted image in for the selected face key.
+ * substitute every inpainted face's image in for its face key. Multiple faces of
+ * the same capture may be inpainted, so all of them are applied here.
  */
 function buildFacesWithInpaint(
   cubeFaceUrls: CubeFaceUrls,
-  selectedFace: CubeFaceKey,
-  inpaintedUrl: string,
+  inpaintedFaces: Partial<Record<CubeFaceKey, { maskDataUrl: string; inpaintedUrl: string }>>,
 ): CubeFaceUrls {
-  return { ...cubeFaceUrls, [selectedFace]: inpaintedUrl }
+  const next: CubeFaceUrls = { ...cubeFaceUrls }
+  for (const [face, entry] of Object.entries(inpaintedFaces)) {
+    if (entry) next[face as CubeFaceKey] = entry.inpaintedUrl
+  }
+  return next
 }
 
 export function MarbleModePicker({ slug, marbleSeed }: MarbleModePickerProps) {
   const phase = useCubeCapture(selectPhase)
   const cubeFaceUrls = useCubeCapture(selectCubeFaceUrls)
-  const selectedFace = useCubeCapture(selectSelectedFace)
-  const inpaintedUrl = useCubeCapture(selectInpaintedUrl)
+  const inpaintedFaces = useCubeCapture(selectInpaintedFaces)
   const captureIndex = useCubeCapture((s) => s.captureIndex)
   const setMode = useCubeCapture((s) => s.setMode)
   const setEquirect = useCubeCapture((s) => s.setEquirect)
@@ -111,20 +116,34 @@ export function MarbleModePicker({ slug, marbleSeed }: MarbleModePickerProps) {
 
   const [error, setError] = useState<string | null>(null)
 
-  // The faces object with the inpainted face swapped in for the selected key.
+  // The faces object with every inpainted face swapped in for its key. Both the
+  // equirect stitch and the multi-image set are derived from this, so all
+  // inpainted faces are reflected — not just the most recent one.
   const facesWithInpaint = useMemo<CubeFaceUrls | null>(() => {
-    if (!cubeFaceUrls || !selectedFace || !inpaintedUrl) return null
-    return buildFacesWithInpaint(cubeFaceUrls, selectedFace, inpaintedUrl)
-  }, [cubeFaceUrls, selectedFace, inpaintedUrl])
+    if (!cubeFaceUrls) return null
+    if (Object.keys(inpaintedFaces).length === 0) return null
+    return buildFacesWithInpaint(cubeFaceUrls, inpaintedFaces)
+  }, [cubeFaceUrls, inpaintedFaces])
 
-  // Multi-image is only available when the inpainted face is one of the 4
-  // horizontal faces. cubeToMultiImage returns null for +Y / -Y.
+  // The 4 cardinal faces (px/nx/pz/nz) already carry their inpaints in
+  // facesWithInpaint, so the multi-image set is derived directly from it.
+  // cubeToMultiImage is used purely as the availability check: it returns null
+  // for vertical (+Y/-Y) faces, which can't be represented by horizontal azimuths.
   const cardinalFaces = useMemo(() => {
-    if (!facesWithInpaint || !selectedFace) return null
-    return cubeToMultiImage(facesWithInpaint, selectedFace)
-  }, [facesWithInpaint, selectedFace])
-  const multiImageDisabled =
-    !cardinalFaces || selectedFace === 'py' || selectedFace === 'ny'
+    if (!facesWithInpaint) return null
+    return cubeToMultiImage(facesWithInpaint, 'pz')
+  }, [facesWithInpaint])
+
+  // Which inpainted faces are cardinal (appear in multi-image) vs. vertical only.
+  const inpaintedFaceKeys = useMemo(
+    () => Object.keys(inpaintedFaces) as CubeFaceKey[],
+    [inpaintedFaces],
+  )
+  const hasCardinalInpaint = inpaintedFaceKeys.some((k) => CARDINAL_FACE_KEYS.includes(k))
+  const hasVerticalInpaint = inpaintedFaceKeys.some((k) => k === 'py' || k === 'ny')
+  // Multi-image is only meaningful when at least one inpainted face is cardinal;
+  // a capture whose only inpaints are top/bottom can't surface them here.
+  const multiImageDisabled = !cardinalFaces || !hasCardinalInpaint
 
   const isBusy = phase === 'stitching' || phase === 'marbling'
 
@@ -271,7 +290,7 @@ export function MarbleModePicker({ slug, marbleSeed }: MarbleModePickerProps) {
                 disabled={multiImageDisabled}
                 title={
                   multiImageDisabled
-                    ? 'Unavailable: the inpainted face is the top/bottom of the cube'
+                    ? 'Unavailable: no inpainted face is one of the 4 cardinal (horizontal) faces'
                     : 'Send the 4 cardinal faces for native Marble fusion'
                 }
                 className="group flex flex-col items-stretch gap-2 rounded border border-white/15 bg-black/40 p-3 text-left transition-[border-color,background-color] hover:border-white/40 hover:bg-white/10 focus:outline-none focus-visible:ring-1 focus-visible:ring-white/60 disabled:cursor-not-allowed disabled:opacity-40"
@@ -288,8 +307,9 @@ export function MarbleModePicker({ slug, marbleSeed }: MarbleModePickerProps) {
                 {multiImageDisabled && (
                   <span className="mt-0.5 flex items-start gap-1.5 text-[11px] leading-snug text-amber-300/90">
                     <WarningIcon size={13} weight="bold" className="mt-px flex-shrink-0" />
-                    The inpainted face is the top/bottom of the cube. A vertical inpaint can't be
-                    represented by horizontal azimuths — use Equirect instead.
+                    {hasVerticalInpaint
+                      ? "Your inpaints are on the top/bottom (+Y/-Y) of the cube. Vertical inpaints can't be represented by horizontal azimuths and won't appear in multi-image — use Equirect instead."
+                      : "No inpainted face is one of the 4 cardinal (horizontal) faces — use Equirect instead."}
                   </span>
                 )}
               </button>

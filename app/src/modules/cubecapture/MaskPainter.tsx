@@ -41,7 +41,9 @@ export function MaskPainter({ slug }: Props) {
   const cubeFaceUrls = useCubeCapture((s: CubeCaptureStore) => s.cubeFaceUrls)
   const captureIndex = useCubeCapture((s: CubeCaptureStore) => s.captureIndex)
   const setMask = useCubeCapture((s: CubeCaptureStore) => s.setMask)
-  const setInpainted = useCubeCapture((s: CubeCaptureStore) => s.setInpainted)
+  const recordInpainted = useCubeCapture(
+    (s: CubeCaptureStore) => s.recordInpainted,
+  )
   const setPhase = useCubeCapture((s: CubeCaptureStore) => s.setPhase)
   const reset = useCubeCapture((s: CubeCaptureStore) => s.reset)
 
@@ -192,8 +194,9 @@ export function MaskPainter({ slug }: Props) {
       if (!result?.inpaintedUrl) {
         throw new Error('/__cube-inpaint returned no inpaintedUrl')
       }
-      setInpainted(result.inpaintedUrl)
-      setPhase('mode-picking')
+      // Record this face's result and return to the picker (recordInpainted
+      // sets phase back to 'picking') so the user can inpaint another face.
+      recordInpainted(selectedFace, maskDataUrl, result.inpaintedUrl)
     } catch (err) {
       console.error('MaskPainter: inpaint failed', err)
       setError(err instanceof Error ? err.message : 'inpaint failed')
@@ -205,8 +208,8 @@ export function MaskPainter({ slug }: Props) {
   }, [
     captureIndex,
     prompt,
+    recordInpainted,
     selectedFace,
-    setInpainted,
     setMask,
     setPhase,
     slug,

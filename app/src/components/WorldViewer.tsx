@@ -366,7 +366,7 @@ export function WorldViewer({
           and renders null otherwise. Only mounted in edit mode. */}
       {editing && (
         <>
-          <CubeFacePicker />
+          <CubeFacePicker slug={desiredSlug} />
           <MaskPainter slug={desiredSlug} />
           <MarbleModePicker slug={desiredSlug} marbleSeed={marbleSeed} />
         </>
