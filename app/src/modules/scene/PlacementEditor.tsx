@@ -17,11 +17,15 @@ import {
   Cube,
   GlobeSimple,
   Plus,
+  Camera,
+  Eraser,
+  Stack,
 } from '@phosphor-icons/react'
 import * as THREE from 'three'
 import { AppButton } from '../../components/AppButton'
 import { ChromePanel, ChromeThumbnail, chrome } from '../../components/AppChrome'
-import { ObjectRenderMode, type WorldObjectAsset, type WorldObjectPhysics, type WorldObjectPlacement, type WorldSceneProject, type WorldSceneSun } from '../../types/world'
+import { ObjectRenderMode, type EraserRegion, type Vec3Tuple, type WorldCompositionLayer, type WorldObjectAsset, type WorldObjectPhysics, type WorldObjectPlacement, type WorldSceneProject, type WorldSceneSun } from '../../types/world'
+import { useCubeCapture } from '../cubecapture/useCubeCapture'
 import { OBJECT_SCALE } from './SceneObject'
 import { getInitialPlacements } from './placements'
 import { DROP_TARGET_LAYER } from './dropTargets'
@@ -133,6 +137,28 @@ export interface PlacementEditorController {
   openWorldFolder: () => void
   saveProject: () => Promise<boolean>
   setFlushSelectedTransformHandler: (handler: (() => WorldObjectPlacement[] | null) | null) => void
+  // ---- Cube-capture / world-composition layers ----
+  worlds: WorldCompositionLayer[]
+  /** Start a cube capture from the current camera position (CubeCaptureController reads the live camera). */
+  beginCubeCapture: () => void
+  /** True while a cube capture flow is active (store phase !== 'idle'). */
+  cubeCaptureActive: boolean
+  /** When a patch world finished marbling, append it as a composition layer anchored at the capture position. */
+  addWorldLayerFromPendingCapture: () => void
+  /** True when the capture store has a pending (placed-but-not-yet-added) patch world. */
+  pendingWorldLayer: boolean
+  /** Append a default sphere eraser to the given patch layer (carves the primary splat). */
+  addEraser: (layerId: string) => void
+  /** Update a single eraser transform component on a patch layer. */
+  updateEraserTransform: (layerId: string, eraserId: string, field: TransformField, axis: TransformAxis, value: number) => void
+  /** Remove one eraser from a patch layer. */
+  removeEraser: (layerId: string, eraserId: string) => void
+  /** Update a patch layer's anchor transform component. */
+  updateLayerAnchor: (layerId: string, field: 'position' | 'rotation', axis: TransformAxis, value: number) => void
+  /** Update a patch layer's uniform anchor scale. */
+  updateLayerScale: (layerId: string, scale: number) => void
+  /** Remove a composition layer (and its erasers). */
+  removeWorldLayer: (layerId: string) => void
 }
 
 interface EditorBaseline {
@@ -144,6 +170,7 @@ interface EditorBaseline {
   groundPlaneColliderEnabled: boolean
   shadowCatcherOpacity: number
   shadowCatcherColor: string
+  worlds: WorldCompositionLayer[]
   signature: string
 }
 
@@ -186,6 +213,30 @@ function cloneSun(sun: WorldSceneSun = DEFAULT_SCENE_SUN): WorldSceneSun {
   }
 }
 
+function cloneEraser(eraser: EraserRegion): EraserRegion {
+  return {
+    ...eraser,
+    position: [...eraser.position],
+    rotation: [...eraser.rotation],
+    scale: [...eraser.scale],
+  }
+}
+
+function cloneWorlds(worlds: WorldCompositionLayer[] = []): WorldCompositionLayer[] {
+  return worlds.map((layer) => ({
+    ...layer,
+    anchor: {
+      position: [...layer.anchor.position],
+      rotation: [...layer.anchor.rotation],
+      scale: layer.anchor.scale,
+    },
+    erasersOnPrimary: layer.erasersOnPrimary?.map(cloneEraser),
+    capture: layer.capture
+      ? { ...layer.capture, capturePosition: [...layer.capture.capturePosition] }
+      : undefined,
+  }))
+}
+
 function signature(value: unknown) {
   return JSON.stringify(value)
 }
@@ -198,6 +249,7 @@ function editorStateSignature(
   groundPlaneColliderEnabled: boolean,
   shadowCatcherOpacity: number,
   shadowCatcherColor: string,
+  worlds: WorldCompositionLayer[],
 ) {
   return signature({
     instances,
@@ -207,6 +259,7 @@ function editorStateSignature(
     groundPlaneColliderEnabled,
     shadowCatcherOpacity,
     shadowCatcherColor,
+    worlds,
   })
 }
 
@@ -236,6 +289,7 @@ function makeEditorBaseline({
   const shadowCatcherColor = normalizeShadowCatcherColor(sceneProject?.shadowCatcherColor)
   const instances = clonePlacements(getInitialPlacements(objects, sceneProject?.instances))
   const sun = cloneSun(sceneProject?.sun)
+  const worlds = cloneWorlds(sceneProject?.worlds)
 
   return {
     slug,
@@ -246,6 +300,7 @@ function makeEditorBaseline({
     groundPlaneColliderEnabled,
     shadowCatcherOpacity,
     shadowCatcherColor,
+    worlds,
     signature: editorStateSignature(
       instances,
       sun,
@@ -254,6 +309,7 @@ function makeEditorBaseline({
       groundPlaneColliderEnabled,
       shadowCatcherOpacity,
       shadowCatcherColor,
+      worlds,
     ),
   }
 }
@@ -267,6 +323,7 @@ function isDraftDirty(
   groundPlaneColliderEnabled: boolean,
   shadowCatcherOpacity: number,
   shadowCatcherColor: string,
+  worlds: WorldCompositionLayer[],
 ) {
   return editorStateSignature(
     instances,
@@ -276,6 +333,7 @@ function isDraftDirty(
     groundPlaneColliderEnabled,
     shadowCatcherOpacity,
     shadowCatcherColor,
+    worlds,
   ) !== baseline.signature
 }
 
@@ -688,6 +746,7 @@ export function usePlacementEditor({
   const [groundPlaneColliderEnabled, setGroundPlaneColliderEnabled] = useState(incomingBaseline.groundPlaneColliderEnabled)
   const [shadowCatcherOpacity, setShadowCatcherOpacity] = useState(incomingBaseline.shadowCatcherOpacity)
   const [shadowCatcherColor, setShadowCatcherColor] = useState(incomingBaseline.shadowCatcherColor)
+  const [worlds, setWorlds] = useState<WorldCompositionLayer[]>(() => cloneWorlds(incomingBaseline.worlds))
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [mode, setMode] = useState<TransformMode>('translate')
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
@@ -702,6 +761,7 @@ export function usePlacementEditor({
   const groundPlaneColliderEnabledRef = useRef(groundPlaneColliderEnabled)
   const shadowCatcherOpacityRef = useRef(shadowCatcherOpacity)
   const shadowCatcherColorRef = useRef(shadowCatcherColor)
+  const worldsRef = useRef(worlds)
   const dropSelectedToFloorHandlerRef = useRef<(() => void) | null>(null)
   const flushSelectedTransformHandlerRef = useRef<(() => WorldObjectPlacement[] | null) | null>(null)
 
@@ -718,6 +778,7 @@ export function usePlacementEditor({
     groundPlaneColliderEnabled,
     shadowCatcherOpacity,
     shadowCatcherColor,
+    worlds,
   )
   const canUndo = historyRef.current.past.length > 0
   const canRedo = historyRef.current.future.length > 0
@@ -731,6 +792,7 @@ export function usePlacementEditor({
   groundPlaneColliderEnabledRef.current = groundPlaneColliderEnabled
   shadowCatcherOpacityRef.current = shadowCatcherOpacity
   shadowCatcherColorRef.current = shadowCatcherColor
+  worldsRef.current = worlds
 
   const pushHistory = useCallback((snapshot: WorldObjectPlacement[]) => {
     historyRef.current.past = [...historyRef.current.past, clonePlacements(snapshot)].slice(-HISTORY_LIMIT)
@@ -762,6 +824,7 @@ export function usePlacementEditor({
         groundPlaneColliderEnabledRef.current,
         shadowCatcherOpacityRef.current,
         shadowCatcherColorRef.current,
+        worldsRef.current,
       )
     ) {
       return
@@ -775,6 +838,7 @@ export function usePlacementEditor({
     setGroundPlaneColliderEnabled(incomingBaseline.groundPlaneColliderEnabled)
     setShadowCatcherOpacity(incomingBaseline.shadowCatcherOpacity)
     setShadowCatcherColor(incomingBaseline.shadowCatcherColor)
+    setWorlds(cloneWorlds(incomingBaseline.worlds))
     setSelectedId(null)
     historyRef.current = { past: [], future: [] }
     setSaveStatus('idle')
@@ -1036,8 +1100,139 @@ export function usePlacementEditor({
     setGroundPlaneColliderEnabled(baseline.groundPlaneColliderEnabled)
     setShadowCatcherOpacity(baseline.shadowCatcherOpacity)
     setShadowCatcherColor(baseline.shadowCatcherColor)
+    setWorlds(cloneWorlds(baseline.worlds))
     setSelectedId(null)
   }, [baseline, updateInstances])
+
+  // ---- Cube-capture / world-composition layer actions ----------------------
+  // The live capture state lives in the zustand cube-capture store. The editor
+  // only needs to (a) kick off a capture and (b) consume the result once a patch
+  // world has been marbled (phase 'placing' with a pendingWorldIndex).
+  const cubeCapturePhase = useCubeCapture((s) => s.phase)
+  const pendingWorldIndex = useCubeCapture((s) => s.pendingWorldIndex)
+  const cubeCaptureActive = cubeCapturePhase !== 'idle'
+  const pendingWorldLayer = cubeCapturePhase === 'placing' && pendingWorldIndex != null
+
+  const beginCubeCapture = useCallback(() => {
+    // CubeCaptureController reads the real camera position via useThree and
+    // overwrites this placeholder, so a zero vector is fine here.
+    useCubeCapture.getState().beginCapture([0, 0, 0])
+  }, [])
+
+  // Mutate the worlds array immutably and mark the project dirty.
+  const mutateWorlds = useCallback(
+    (updater: (current: WorldCompositionLayer[]) => WorldCompositionLayer[]) => {
+      setWorlds((current) => {
+        const next = updater(cloneWorlds(current))
+        if (signature(next) === signature(current)) return current
+        setSaveStatus('idle')
+        return next
+      })
+    },
+    [],
+  )
+
+  const addWorldLayerFromPendingCapture = useCallback(() => {
+    const capture = useCubeCapture.getState()
+    if (capture.pendingWorldIndex == null) return
+    const position: Vec3Tuple = capture.capturePosition ?? [0, 0, 0]
+    const layer: WorldCompositionLayer = {
+      id: `layer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+      role: 'patch',
+      worldSlug: slug,
+      worldIndex: capture.pendingWorldIndex,
+      anchor: { position: [...position], rotation: [0, 0, 0], scale: 1 },
+      erasersOnPrimary: [],
+    }
+    mutateWorlds((current) => [...current, layer])
+    // The capture flow is complete once the layer is placed.
+    capture.reset()
+  }, [mutateWorlds, slug])
+
+  const addEraser = useCallback(
+    (layerId: string) => {
+      // Default sphere eraser at the layer anchor (typically the capture point).
+      mutateWorlds((current) =>
+        current.map((layer) => {
+          if (layer.id !== layerId) return layer
+          const eraser: EraserRegion = {
+            id: `eraser-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+            type: 'sphere',
+            position: [...layer.anchor.position],
+            rotation: [0, 0, 0],
+            scale: [1, 1, 1],
+          }
+          return { ...layer, erasersOnPrimary: [...(layer.erasersOnPrimary ?? []), eraser] }
+        }),
+      )
+    },
+    [mutateWorlds],
+  )
+
+  const updateEraserTransform = useCallback(
+    (layerId: string, eraserId: string, field: TransformField, axis: TransformAxis, value: number) => {
+      mutateWorlds((current) =>
+        current.map((layer) => {
+          if (layer.id !== layerId) return layer
+          return {
+            ...layer,
+            erasersOnPrimary: (layer.erasersOnPrimary ?? []).map((eraser) => {
+              if (eraser.id !== eraserId) return eraser
+              const nextField = [...eraser[field]] as Vec3Tuple
+              nextField[axis] = value
+              return { ...eraser, [field]: nextField }
+            }),
+          }
+        }),
+      )
+    },
+    [mutateWorlds],
+  )
+
+  const removeEraser = useCallback(
+    (layerId: string, eraserId: string) => {
+      mutateWorlds((current) =>
+        current.map((layer) =>
+          layer.id === layerId
+            ? { ...layer, erasersOnPrimary: (layer.erasersOnPrimary ?? []).filter((e) => e.id !== eraserId) }
+            : layer,
+        ),
+      )
+    },
+    [mutateWorlds],
+  )
+
+  const updateLayerAnchor = useCallback(
+    (layerId: string, field: 'position' | 'rotation', axis: TransformAxis, value: number) => {
+      mutateWorlds((current) =>
+        current.map((layer) => {
+          if (layer.id !== layerId) return layer
+          const nextField = [...layer.anchor[field]] as Vec3Tuple
+          nextField[axis] = value
+          return { ...layer, anchor: { ...layer.anchor, [field]: nextField } }
+        }),
+      )
+    },
+    [mutateWorlds],
+  )
+
+  const updateLayerScale = useCallback(
+    (layerId: string, scale: number) => {
+      mutateWorlds((current) =>
+        current.map((layer) =>
+          layer.id === layerId ? { ...layer, anchor: { ...layer.anchor, scale } } : layer,
+        ),
+      )
+    },
+    [mutateWorlds],
+  )
+
+  const removeWorldLayer = useCallback(
+    (layerId: string) => {
+      mutateWorlds((current) => current.filter((layer) => layer.id !== layerId))
+    },
+    [mutateWorlds],
+  )
 
   const openWorldFolder = useCallback(() => {
     if (!import.meta.env.DEV) return
@@ -1050,6 +1245,7 @@ export function usePlacementEditor({
     if (!import.meta.env.DEV) return true
     try {
       const flushedInstances = flushSelectedTransformHandlerRef.current?.()
+      const savedWorlds = cloneWorlds(worldsRef.current)
       const project: WorldSceneProject = {
         version: projectVersion,
         instances: clonePlacements(flushedInstances ?? instancesRef.current),
@@ -1059,6 +1255,9 @@ export function usePlacementEditor({
         groundPlaneColliderEnabled: groundPlaneColliderEnabledRef.current,
         shadowCatcherOpacity: shadowCatcherOpacityRef.current,
         shadowCatcherColor: shadowCatcherColorRef.current,
+        // Omit `worlds` entirely when empty so a legacy single-splat scene.json
+        // round-trips byte-identical (absence = legacy render path).
+        ...(savedWorlds.length ? { worlds: savedWorlds } : {}),
       }
       setSaveStatus('saving')
       const response = await fetch(`/__scene-project?slug=${encodeURIComponent(slug)}`, {
@@ -1075,6 +1274,9 @@ export function usePlacementEditor({
       const savedShadowCatcherColor = normalizeShadowCatcherColor(savedProject.shadowCatcherColor)
       const savedInstances = clonePlacements(savedProject.instances)
       const savedSun = cloneSun(savedProject.sun)
+      // Prefer the server's echoed worlds; fall back to what we sent so the
+      // layer/eraser edits aren't lost if the sanitizer drops the field.
+      const savedLayers = cloneWorlds(savedProject.worlds ?? savedWorlds)
       setBaseline({
         slug,
         instances: savedInstances,
@@ -1084,6 +1286,7 @@ export function usePlacementEditor({
         groundPlaneColliderEnabled: savedProject.groundPlaneColliderEnabled ?? true,
         shadowCatcherOpacity: savedShadowCatcherOpacity,
         shadowCatcherColor: savedShadowCatcherColor,
+        worlds: savedLayers,
         signature: editorStateSignature(
           savedInstances,
           savedSun,
@@ -1092,6 +1295,7 @@ export function usePlacementEditor({
           savedProject.groundPlaneColliderEnabled ?? true,
           savedShadowCatcherOpacity,
           savedShadowCatcherColor,
+          savedLayers,
         ),
       })
       setInstances(clonePlacements(savedInstances))
@@ -1101,6 +1305,7 @@ export function usePlacementEditor({
       setGroundPlaneColliderEnabled(savedProject.groundPlaneColliderEnabled ?? true)
       setShadowCatcherOpacity(savedShadowCatcherOpacity)
       setShadowCatcherColor(savedShadowCatcherColor)
+      setWorlds(savedLayers)
       onProjectSaved?.(savedProject)
       setSaveStatus('saved')
       return true
@@ -1263,6 +1468,17 @@ export function usePlacementEditor({
     openWorldFolder,
     saveProject,
     setFlushSelectedTransformHandler,
+    worlds,
+    beginCubeCapture,
+    cubeCaptureActive,
+    addWorldLayerFromPendingCapture,
+    pendingWorldLayer,
+    addEraser,
+    updateEraserTransform,
+    removeEraser,
+    updateLayerAnchor,
+    updateLayerScale,
+    removeWorldLayer,
   }
 }
 
@@ -1540,6 +1756,16 @@ export function PlacementEditorOverlay({ controller }: PlacementEditorOverlayPro
           >
             <ArrowDown size={15} weight="regular" />
             Drop
+          </AppButton>
+          <AppButton
+            className={`justify-center ${controller.cubeCaptureActive ? 'bg-white/15 opacity-100' : ''}`}
+            disabled={controller.cubeCaptureActive}
+            onClick={controller.beginCubeCapture}
+            aria-label="Capture a cube from the current position to re-marble a patch world"
+            title="Capture cube"
+          >
+            <Camera size={15} weight="regular" />
+            {controller.cubeCaptureActive ? 'Capturing…' : 'Capture Cube'}
           </AppButton>
         </div>
       </div>
@@ -1900,8 +2126,145 @@ export function PlacementEditorOverlay({ controller }: PlacementEditorOverlayPro
               </div>
             </div>
           </ChromePanel>
+
+          <WorldLayersPanel controller={controller} />
         </div>
       </div>
     </div>
+  )
+}
+
+// World-composition layers panel: lists patch worlds produced by the cube-capture
+// flow, each with its anchor transform, sphere erasers (numeric transform edit),
+// and an "Add Eraser" action. Also surfaces the "Add World Layer" action once a
+// patch world finishes marbling (capture store phase 'placing').
+const LAYER_TRANSFORM_AXES = TRANSFORM_AXES
+function WorldLayersPanel({ controller }: { controller: PlacementEditorController }) {
+  const { worlds } = controller
+  if (!worlds.length && !controller.pendingWorldLayer) return null
+  return (
+    <ChromePanel className="pointer-events-auto min-h-0 overflow-hidden">
+      <div className={chrome.sectionHeader}>
+        <span className="flex items-center gap-1">
+          <Stack size={13} weight="regular" />
+          World Layers
+        </span>
+        <span className="normal-case tracking-normal">{worlds.length}</span>
+      </div>
+      <div className="max-h-[34vh] overflow-y-auto overflow-x-hidden">
+        <div className="flex flex-col gap-1 p-1 pr-2">
+          {controller.pendingWorldLayer && (
+            <AppButton
+              className="h-7 justify-center bg-white/10"
+              onClick={controller.addWorldLayerFromPendingCapture}
+              aria-label="Add the freshly marbled patch world as a composition layer"
+              title="Add World Layer"
+            >
+              <Plus size={14} weight="regular" />
+              Add World Layer
+            </AppButton>
+          )}
+          {worlds.map((layer) => (
+            <div key={layer.id} className="rounded border border-white/10 bg-black/30 p-1.5">
+              <div className="mb-1 flex items-center justify-between gap-1">
+                <span className="min-w-0">
+                  <span className="block truncate text-xs text-white/90">
+                    {layer.role === 'primary' ? 'Primary' : `Patch · world ${layer.worldIndex}`}
+                  </span>
+                  <span className="block truncate text-[10px] text-white/35">{layer.id}</span>
+                </span>
+                {layer.role !== 'primary' && (
+                  <AppButton
+                    className="h-6 w-6 flex-shrink-0 justify-center text-red-200"
+                    onClick={() => controller.removeWorldLayer(layer.id)}
+                    aria-label="Delete world layer"
+                    title="Delete layer"
+                  >
+                    <Trash size={13} weight="regular" />
+                  </AppButton>
+                )}
+              </div>
+              {layer.role !== 'primary' && (
+                <>
+                  <div className="grid grid-cols-[2.75rem_repeat(3,minmax(0,1fr))] items-center gap-1">
+                    <span className="text-[10px] tracking-[0.16em] text-white/40">Pos</span>
+                    {LAYER_TRANSFORM_AXES.map(({ axis, label }) => (
+                      <label key={`anchor-pos-${axis}`} className="min-w-0">
+                        <span className="sr-only">{`Anchor position ${label}`}</span>
+                        <NumberValueInput
+                          value={layer.anchor.position[axis]}
+                          step={0.01}
+                          onChange={(value) => controller.updateLayerAnchor(layer.id, 'position', axis, value)}
+                          className="h-6 text-[11px]"
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  <div className="mt-1 grid grid-cols-[2.75rem_1fr] items-center gap-1">
+                    <span className="text-[10px] tracking-[0.16em] text-white/40">Scale</span>
+                    <NumberValueInput
+                      value={layer.anchor.scale}
+                      step={0.01}
+                      onChange={(value) => controller.updateLayerScale(layer.id, value)}
+                      className="h-6 text-[11px]"
+                    />
+                  </div>
+                  <div className="mt-1 flex items-center justify-between gap-1">
+                    <span className="text-[10px] tracking-[0.16em] text-white/40">
+                      Erasers ({layer.erasersOnPrimary?.length ?? 0})
+                    </span>
+                    <AppButton
+                      className="h-6 justify-center px-1.5 py-0 text-[10px]"
+                      onClick={() => controller.addEraser(layer.id)}
+                      aria-label="Add a sphere eraser that carves the primary splat"
+                      title="Add eraser"
+                    >
+                      <Eraser size={12} weight="regular" />
+                      Add Eraser
+                    </AppButton>
+                  </div>
+                  {(layer.erasersOnPrimary ?? []).map((eraser) => (
+                    <div key={eraser.id} className="mt-1 rounded bg-white/5 p-1">
+                      <div className="mb-0.5 flex items-center justify-between gap-1">
+                        <span className="truncate text-[10px] text-white/45">{eraser.type} · {eraser.id}</span>
+                        <AppButton
+                          className="h-5 w-5 flex-shrink-0 justify-center text-red-200"
+                          onClick={() => controller.removeEraser(layer.id, eraser.id)}
+                          aria-label="Delete eraser"
+                          title="Delete eraser"
+                        >
+                          <Trash size={11} weight="regular" />
+                        </AppButton>
+                      </div>
+                      {(['position', 'scale'] as const).map((field) => (
+                        <div
+                          key={`${eraser.id}-${field}`}
+                          className="grid grid-cols-[2.5rem_repeat(3,minmax(0,1fr))] items-center gap-1"
+                        >
+                          <span className="text-[9px] uppercase tracking-[0.14em] text-white/35">{field}</span>
+                          {LAYER_TRANSFORM_AXES.map(({ axis, label }) => (
+                            <label key={`${eraser.id}-${field}-${axis}`} className="min-w-0">
+                              <span className="sr-only">{`Eraser ${field} ${label}`}</span>
+                              <NumberValueInput
+                                value={eraser[field][axis]}
+                                step={0.05}
+                                onChange={(value) =>
+                                  controller.updateEraserTransform(layer.id, eraser.id, field, axis, value)
+                                }
+                                className="h-6 text-[11px]"
+                              />
+                            </label>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </ChromePanel>
   )
 }

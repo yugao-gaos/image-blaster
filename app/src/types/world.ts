@@ -73,6 +73,52 @@ export interface WorldSceneSun {
   environmentIntensity?: number
 }
 
+export type EraserSdfType = 'sphere' | 'box' | 'ellipsoid' | 'capsule'
+
+export interface EraserRegion {
+  id: string
+  type: EraserSdfType
+  position: Vec3Tuple
+  rotation: Vec3Tuple
+  scale: Vec3Tuple
+  softEdge?: number   // 0..1, defaults 0
+  invert?: boolean    // defaults false (erase inside)
+}
+
+export interface CubeCaptureMeta {
+  capturePosition: Vec3Tuple        // in scene meters
+  faceSize: number                  // px, default 1024
+  faceIndex: 0 | 1 | 2 | 3 | 4 | 5  // +X,-X,+Y,-Y,+Z,-Z
+  facePngPath: string               // worlds/<slug>/...
+  maskPngPath: string
+  inpaintedFacePath: string
+  inpaintModel: 'fal-ai/flux-pro/v1/fill'
+  marbleSeed: number                // shared with World A
+  marbleInputMode: 'equirect' | 'multi-image'
+  // exactly one of these is populated based on mode:
+  equirectPath?: string             // stitched 4096x2048 (equirect mode)
+  multiImagePaths?: {               // 4 cardinal faces (multi-image mode)
+    az0: string                     // +Z face
+    az90: string                    // +X face
+    az180: string                   // -Z face
+    az270: string                   // -X face
+  }
+}
+
+export interface WorldCompositionLayer {
+  id: string
+  role: 'primary' | 'patch'
+  worldSlug: string
+  worldIndex: number                // which N-world.json
+  anchor: {
+    position: Vec3Tuple             // patch layer's origin in primary's frame
+    rotation: Vec3Tuple
+    scale: number                   // uniform; multiplies layer's own metricScaleFactor
+  }
+  erasersOnPrimary?: EraserRegion[] // only meaningful on patch layers
+  capture?: CubeCaptureMeta         // provenance, present on patch layers
+}
+
 export interface WorldSceneProject {
   version: 1
   instances: WorldObjectPlacement[]
@@ -82,6 +128,7 @@ export interface WorldSceneProject {
   groundPlaneColliderEnabled?: boolean
   shadowCatcherOpacity?: number
   shadowCatcherColor?: string
+  worlds?: WorldCompositionLayer[]  // NEW — absence = single-splat legacy
 }
 
 export interface WorldVersion {

@@ -34,6 +34,18 @@ node .claude/scripts/world/generate-world.mjs --world "$0" --prompt "<empty-envi
 
 Pass `--image` only when an explicit image path is provided or the selected source is not the helper default. Always pass `--prompt` with the synthesized empty-environment caption. For explicit regeneration, append `--regenerate`.
 
+### Marble API flags
+
+The helper exposes the full `marble-1.1` request surface. A concrete seed is always used and recorded in `N-world-request.json` (and the printed result), so a generation can be reproduced later even when `--seed` is omitted.
+
+- `--seed <uint32>` — deterministic generation (0..4294967295). Omit to auto-generate and persist a random seed; reuse a recorded seed to regenerate a structurally similar world.
+- `--is-pano` — treat the input `--image` as an equirectangular panorama (`image_prompt.is_pano: true`).
+- `--disable-recaption` — skip Marble's prompt recaptioning (`world_prompt.disable_recaption: true`); useful when re-marbling a patch and you want the original framing preserved.
+- `--multi-image "<path>@<azimuth>,<path>@<azimuth>,..."` — build a `multi-image` world_prompt from several views, each at its azimuth in degrees. Owns the prompt; `--image` is ignored in this mode.
+- `--reconstruct-images` — with `--multi-image`, let Marble fuse the provided views (`reconstruct_images: true`).
+- `--model <name>` — `marble-1.1` (default) or `marble-1.1-plus`.
+- `--dry-run` — print the assembled request JSON (with the resolved seed) and exit without calling the API. Use to inspect the payload safely.
+
 To fill missing local files from an existing world response, run:
 
 ```bash

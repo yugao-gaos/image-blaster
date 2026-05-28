@@ -26,7 +26,22 @@ import { pathToFileURL } from "node:url";
 
 const ENDPOINT = "https://api.worldlabs.ai/marble/v1";
 const MODEL = "marble-1.1";
+const SUPPORTED_MODELS = new Set(["marble-1.1", "marble-1.1-plus"]);
+const MAX_UINT32 = 4294967295;
 const IMAGE_EXTENSIONS = new Set([".avif", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".webp"]);
+
+function randomSeed() {
+  return Math.floor(Math.random() * (MAX_UINT32 + 1));
+}
+
+function normalizeSeed(value) {
+  if (value === undefined || value === null || value === "") return undefined;
+  const seed = Number(value);
+  if (!Number.isInteger(seed) || seed < 0 || seed > MAX_UINT32) {
+    throw new Error(`--seed must be an integer between 0 and ${MAX_UINT32}.`);
+  }
+  return seed;
+}
 
 async function downloadAsset(url, destPath) {
   if (await pathExists(destPath)) return destPath;
@@ -123,39 +138,108 @@ async function promptFromImageJson(world) {
     .join("\n");
 }
 
-async function imagePrompt(image, textPrompt) {
+async function imageContent(image) {
   if (isUrl(image)) {
     return {
-      type: "image",
-      image_prompt: {
-        source: "uri",
-        uri: image
-      },
-      ...(textPrompt ? { text_prompt: textPrompt } : {})
+      source: "uri",
+      uri: image
     };
   }
 
   const data = await readFile(image);
   const extension = path.extname(image).replace(/^\./, "") || "png";
   return {
-    type: "image",
-    image_prompt: {
-      source: "data_base64",
-      data_base64: data.toString("base64"),
-      extension,
-      mime_type: inferMime(image)
-    },
-    ...(textPrompt ? { text_prompt: textPrompt } : {})
+    source: "data_base64",
+    data_base64: data.toString("base64"),
+    extension,
+    mime_type: inferMime(image)
   };
 }
 
-async function buildRequest({ world, image, prompt }) {
+async function imagePrompt(image, textPrompt, { isPano = false, disableRecaption = false } = {}) {
+  const content = await imageContent(image);
+  return {
+    type: "image",
+    image_prompt: {
+      ...content,
+      ...(isPano ? { is_pano: true } : {})
+    },
+    ...(textPrompt ? { text_prompt: textPrompt } : {}),
+    ...(disableRecaption ? { disable_recaption: true } : {})
+  };
+}
+
+function parseMultiImage(spec) {
+  return String(spec)
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const at = entry.lastIndexOf("@");
+      if (at === -1) {
+        throw new Error(`--multi-image entry "${entry}" must be in the form <path>@<azimuth>.`);
+      }
+      const imagePath = entry.slice(0, at).trim();
+      const azimuth = Number(entry.slice(at + 1).trim());
+      if (!imagePath) {
+        throw new Error(`--multi-image entry "${entry}" is missing a path.`);
+      }
+      if (!Number.isFinite(azimuth)) {
+        throw new Error(`--multi-image entry "${entry}" has a non-numeric azimuth.`);
+      }
+      return { imagePath, azimuth };
+    });
+}
+
+async function multiImagePrompt(entries, textPrompt, { reconstructImages = false, disableRecaption = false } = {}) {
+  if (!entries.length) {
+    throw new Error("--multi-image requires at least one <path>@<azimuth> entry.");
+  }
+  const multi_image_prompt = [];
+  for (const { imagePath, azimuth } of entries) {
+    multi_image_prompt.push({
+      content: await imageContent(imagePath),
+      azimuth
+    });
+  }
+  return {
+    type: "multi-image",
+    multi_image_prompt,
+    ...(reconstructImages ? { reconstruct_images: true } : {}),
+    ...(textPrompt ? { text_prompt: textPrompt } : {}),
+    ...(disableRecaption ? { disable_recaption: true } : {})
+  };
+}
+
+async function buildRequest({
+  world,
+  image,
+  prompt,
+  model = MODEL,
+  seed,
+  isPano = false,
+  disableRecaption = false,
+  multiImage,
+  reconstructImages = false
+}) {
   const textPrompt = prompt || await promptFromImageJson(world);
+  const seedField = seed === undefined ? {} : { seed };
+
+  if (multiImage && multiImage.length) {
+    return {
+      display_name: world,
+      model,
+      ...seedField,
+      world_prompt: await multiImagePrompt(multiImage, textPrompt, { reconstructImages, disableRecaption })
+    };
+  }
+
   if (image) {
     return {
       display_name: world,
-      model: MODEL,
-      world_prompt: await imagePrompt(image, textPrompt)
+      model,
+      ...seedField,
+      world_prompt: await imagePrompt(image, textPrompt, { isPano, disableRecaption })
     };
   }
 
@@ -165,10 +249,12 @@ async function buildRequest({ world, image, prompt }) {
 
   return {
     display_name: world,
-    model: MODEL,
+    model,
+    ...seedField,
     world_prompt: {
       type: "text",
-      text_prompt: textPrompt
+      text_prompt: textPrompt,
+      ...(disableRecaption ? { disable_recaption: true } : {})
     }
   };
 }
@@ -209,7 +295,7 @@ async function writeWorldRequest(metadataPath, metadata) {
     kind: "world",
     provider: "world-labs",
     endpoint: ENDPOINT,
-    model: MODEL,
+    model: metadata.request?.model || MODEL,
     ...metadata,
     result: stripBase64(metadata.result)
   });
@@ -279,10 +365,42 @@ export async function generateWorld(options) {
     image,
     prompt,
     regenerate = false,
-    pollIntervalMs = 15000
+    pollIntervalMs = 15000,
+    model = MODEL,
+    seed,
+    isPano = false,
+    disableRecaption = false,
+    multiImage,
+    reconstructImages = false,
+    dryRun = false
   } = options;
 
   if (!world) throw new Error("world is required.");
+
+  // Always resolve a concrete seed so generations are reproducible and the
+  // value is recorded for later reuse (e.g. patch-world regeneration).
+  const resolvedSeed = seed === undefined ? randomSeed() : seed;
+
+  const buildOptions = {
+    world,
+    image,
+    prompt,
+    model,
+    seed: resolvedSeed,
+    isPano,
+    disableRecaption,
+    multiImage,
+    reconstructImages
+  };
+
+  if (dryRun) {
+    return {
+      world,
+      dry_run: true,
+      seed: resolvedSeed,
+      request: await buildRequest(buildOptions)
+    };
+  }
 
   const outputDir = `worlds/${world}/output/world`;
   await ensureDir(outputDir);
@@ -302,15 +420,20 @@ export async function generateWorld(options) {
   const requestIndex = activeRequest?.index ?? await nextWorldIndex(outputDir);
   const metadataPath = activeRequest?.path ?? requestPath(outputDir, requestIndex, "world");
   const worldPath = artifactPath(outputDir, requestIndex, "world", ".json");
-  const request = activeRequest?.data?.request || await buildRequest({ world, image, prompt });
+  const request = activeRequest?.data?.request || await buildRequest(buildOptions);
   const submittedAt = activeRequest?.data?.submitted_at || new Date().toISOString();
-  const inputFiles = image ? [image] : [];
+  const inputFiles = multiImage?.length
+    ? multiImage.map((entry) => entry.imagePath)
+    : image
+      ? [image]
+      : [];
   const textPrompt = prompt || request.world_prompt?.text_prompt || request.world_prompt?.image_prompt?.text_prompt;
   const baseMetadata = {
     index: requestIndex,
     status: "submitted",
     request_id: activeRequest?.data?.request_id,
     submitted_at: submittedAt,
+    seed: request.seed,
     prompt: textPrompt,
     input_files: inputFiles,
     output_files: [],
@@ -372,6 +495,7 @@ export async function generateWorld(options) {
   return {
     world,
     index: requestIndex,
+    seed: request.seed,
     operation_id: operationId(completed),
     request_metadata: metadataPath,
     world_json: worldPath,
@@ -385,19 +509,44 @@ async function main() {
   const { flags } = parseArgs();
   const world = one(flags, "world");
   if (!world) {
-    throw new Error("Usage: node generate-world.mjs --world <world-name> [--image <path-or-url>] [--prompt <text>] [--regenerate]");
+    throw new Error("Usage: node generate-world.mjs --world <world-name> [--image <path-or-url>] [--prompt <text>] [--seed <uint32>] [--is-pano] [--disable-recaption] [--multi-image \"<path>@<az>,...\"] [--reconstruct-images] [--model <name>] [--dry-run] [--regenerate]");
   }
 
   const prompt = [...many(flags, "prompt"), ...many(flags, "description")].join("\n").trim() || undefined;
+
+  const model = one(flags, "model", MODEL);
+  if (!SUPPORTED_MODELS.has(model)) {
+    throw new Error(`--model must be one of: ${[...SUPPORTED_MODELS].join(", ")}.`);
+  }
+
+  const seed = normalizeSeed(one(flags, "seed"));
+  const isPano = Boolean(flags["is-pano"]);
+  const disableRecaption = Boolean(flags["disable-recaption"]);
+  const reconstructImages = Boolean(flags["reconstruct-images"]);
+  const dryRun = Boolean(flags["dry-run"]);
+
+  const multiImageSpec = one(flags, "multi-image");
+  const multiImage = multiImageSpec ? parseMultiImage(multiImageSpec) : undefined;
+
+  // --multi-image owns the world_prompt; ignore --image in that mode.
   const explicitImage = one(flags, "image");
-  const image = explicitImage || await latestSourceImage(`worlds/${world}/source`);
+  const image = multiImage
+    ? undefined
+    : explicitImage || await latestSourceImage(`worlds/${world}/source`);
 
   const result = await generateWorld({
     world,
     image,
     prompt,
     regenerate: Boolean(flags.regenerate),
-    pollIntervalMs: one(flags, "poll-interval-ms", 15000)
+    pollIntervalMs: one(flags, "poll-interval-ms", 15000),
+    model,
+    seed,
+    isPano,
+    disableRecaption,
+    multiImage,
+    reconstructImages,
+    dryRun
   });
 
   console.log(JSON.stringify(result, null, 2));

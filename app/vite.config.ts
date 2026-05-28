@@ -2,7 +2,8 @@ import { defineConfig, type Plugin, type ViteDevServer } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 import fs from 'fs'
-import { spawn } from 'child_process'
+import { spawn, spawnSync } from 'child_process'
+import type { IncomingMessage } from 'http'
 
 type WorldManifest = Record<string, unknown> & {
   assets?: Record<string, unknown> & {
@@ -453,6 +454,28 @@ function worldsPlugin(): Plugin {
     return requestMetadataFiles(worldDir, 'world').map((request) => request.index)
   }
 
+  // Synchronous mirror of request-metadata.mjs's nextIndex(): scan a directory for
+  // indexed files (visible + hidden request sidecars) whose slug matches and return
+  // the next free integer index. Matches the synchronous fs style used throughout.
+  function nextIndex(dir: string, slug: string) {
+    if (!fs.existsSync(dir)) return 0
+    let maxIndex = -1
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue
+      const parsed = parseIndexedName(entry.name)
+      if (!parsed || parsed.slug !== slug || !Number.isInteger(parsed.index)) continue
+      maxIndex = Math.max(maxIndex, parsed.index)
+    }
+    return maxIndex + 1
+  }
+
+  // Predict the index generate-world.mjs will allocate for its next world artifact.
+  function nextWorldIndex(slug: string) {
+    const indexes = [...new Set([...worldAssetIndexes(slug), ...worldRequestIndexes(slug)])]
+    const maxIndex = indexes.reduce((max, value) => Math.max(max, value), -1)
+    return maxIndex + 1
+  }
+
   function readWorldVersions(slug: string) {
     const indexes = [...new Set([
       ...worldAssetIndexes(slug),
@@ -540,6 +563,41 @@ function worldsPlugin(): Plugin {
       ? shadowCatcherColor.toLowerCase()
       : undefined
 
+    // Optional multi-world composition layers (backward compatible: absent = single-splat legacy).
+    // Validate the array shape and each layer's required fields; pass through optional
+    // erasersOnPrimary/capture provenance as-is when present.
+    const worlds = (() => {
+      if (record.worlds === undefined) return undefined
+      if (!Array.isArray(record.worlds)) return undefined
+      const layers = record.worlds.flatMap((layer): Array<Record<string, unknown>> => {
+        if (!layer || typeof layer !== 'object') return []
+        const item = layer as Record<string, unknown>
+        const { id, role, worldSlug, worldIndex, anchor, erasersOnPrimary, capture } = item
+        if (typeof id !== 'string') return []
+        if (role !== 'primary' && role !== 'patch') return []
+        if (typeof worldSlug !== 'string') return []
+        if (typeof worldIndex !== 'number' || !Number.isFinite(worldIndex)) return []
+        if (!anchor || typeof anchor !== 'object') return []
+        const anchorRecord = anchor as Record<string, unknown>
+        if (!isVec3(anchorRecord.position) || !isVec3(anchorRecord.rotation)) return []
+        if (typeof anchorRecord.scale !== 'number' || !Number.isFinite(anchorRecord.scale)) return []
+        return [{
+          id,
+          role,
+          worldSlug,
+          worldIndex,
+          anchor: {
+            position: anchorRecord.position,
+            rotation: anchorRecord.rotation,
+            scale: anchorRecord.scale,
+          },
+          ...(Array.isArray(erasersOnPrimary) ? { erasersOnPrimary } : {}),
+          ...(capture && typeof capture === 'object' ? { capture } : {}),
+        }]
+      })
+      return layers
+    })()
+
     return {
       version: PROJECT_VERSION,
       instances,
@@ -549,6 +607,7 @@ function worldsPlugin(): Plugin {
       ...(typeof groundPlaneColliderEnabled === 'boolean' ? { groundPlaneColliderEnabled } : {}),
       ...(normalizedShadowCatcherOpacity !== undefined ? { shadowCatcherOpacity: normalizedShadowCatcherOpacity } : {}),
       ...(normalizedShadowCatcherColor !== undefined ? { shadowCatcherColor: normalizedShadowCatcherColor } : {}),
+      ...(worlds !== undefined ? { worlds } : {}),
     }
   }
 
@@ -836,6 +895,359 @@ function worldsPlugin(): Plugin {
           }
         })
       })
+
+      // Shared helpers for the cube-capture middlewares below.
+      const outputWorldDir = (slug: string) => {
+        const worldDir = path.resolve(worldsDir, slug)
+        const isInsideWorlds = worldDir !== worldsDir && worldDir.startsWith(`${worldsDir}${path.sep}`)
+        if (!isInsideWorlds) return null
+        return path.join(worldDir, 'output', 'world')
+      }
+      const cubeWorldUrl = (slug: string, fileName: string) => worldsUrl(slug, path.join('output', 'world', fileName))
+      const cubeWorldRel = (slug: string, fileName: string) =>
+        `worlds/${slug}/output/world/${fileName}`
+      const decodeBase64Png = (value: unknown) => {
+        if (typeof value !== 'string') return null
+        // tolerate data: URL prefixes (e.g. "data:image/png;base64,....")
+        const comma = value.indexOf(',')
+        const raw = value.startsWith('data:') && comma !== -1 ? value.slice(comma + 1) : value
+        try {
+          return Buffer.from(raw, 'base64')
+        } catch {
+          return null
+        }
+      }
+      const readJsonBody = (
+        req: IncomingMessage,
+        onBody: (body: unknown) => void,
+        onError: () => void,
+      ) => {
+        let body = ''
+        req.setEncoding('utf-8')
+        req.on('data', (chunk: string) => {
+          body += chunk
+        })
+        req.on('end', () => {
+          try {
+            onBody(JSON.parse(body))
+          } catch {
+            onError()
+          }
+        })
+      }
+
+      const CUBE_FACE_KEYS = ['px', 'nx', 'py', 'ny', 'pz', 'nz'] as const
+
+      // POST /__cube-capture?slug=<slug> — persist 6 captured cube faces, allocate index N.
+      server.middlewares.use('/__cube-capture', (req, res) => {
+        res.setHeader('Cache-Control', 'no-store')
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.end('Method not allowed')
+          return
+        }
+        const requestUrl = new URL(req.url || '/', 'http://localhost')
+        const slug = requestUrl.searchParams.get('slug')
+        if (!slug) {
+          res.statusCode = 400
+          res.end('Missing slug')
+          return
+        }
+        const dir = outputWorldDir(slug)
+        if (!dir) {
+          res.statusCode = 400
+          res.end('Invalid slug')
+          return
+        }
+
+        readJsonBody(req, (parsed) => {
+          if (!parsed || typeof parsed !== 'object') {
+            res.statusCode = 400
+            res.end('Invalid body')
+            return
+          }
+          const body = parsed as Record<string, unknown>
+          const faces = body.faces
+          if (!faces || typeof faces !== 'object') {
+            res.statusCode = 400
+            res.end('Missing faces')
+            return
+          }
+          const faceRecord = faces as Record<string, unknown>
+          const buffers: Record<string, Buffer> = {}
+          for (const key of CUBE_FACE_KEYS) {
+            const decoded = decodeBase64Png(faceRecord[key])
+            if (!decoded) {
+              res.statusCode = 400
+              res.end(`Invalid or missing face: ${key}`)
+              return
+            }
+            buffers[key] = decoded
+          }
+
+          const captureIndex = nextIndex(dir, 'cube-capture')
+          fs.mkdirSync(dir, { recursive: true })
+          const faceUrls: Record<string, string> = {}
+          for (const key of CUBE_FACE_KEYS) {
+            const fileName = `cube-capture-${captureIndex}-${key}.png`
+            fs.writeFileSync(path.join(dir, fileName), buffers[key])
+            faceUrls[key] = cubeWorldUrl(slug, fileName)
+          }
+
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ captureIndex, faceUrls }))
+        }, () => {
+          res.statusCode = 400
+          res.end('Invalid JSON')
+        })
+      })
+
+      // POST /__cube-inpaint?slug=<slug>&captureIndex=<n>&faceKey=<key>
+      // Writes the mask, then runs inpaint-cube-face.mjs synchronously (Marble-independent).
+      server.middlewares.use('/__cube-inpaint', (req, res) => {
+        res.setHeader('Cache-Control', 'no-store')
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.end('Method not allowed')
+          return
+        }
+        const requestUrl = new URL(req.url || '/', 'http://localhost')
+        const slug = requestUrl.searchParams.get('slug')
+        const captureIndexParam = requestUrl.searchParams.get('captureIndex')
+        const faceKey = requestUrl.searchParams.get('faceKey')
+        if (!slug) {
+          res.statusCode = 400
+          res.end('Missing slug')
+          return
+        }
+        const dir = outputWorldDir(slug)
+        if (!dir) {
+          res.statusCode = 400
+          res.end('Invalid slug')
+          return
+        }
+        const captureIndex = Number(captureIndexParam)
+        if (captureIndexParam === null || !Number.isInteger(captureIndex)) {
+          res.statusCode = 400
+          res.end('Invalid captureIndex')
+          return
+        }
+        if (!faceKey || !(CUBE_FACE_KEYS as readonly string[]).includes(faceKey)) {
+          res.statusCode = 400
+          res.end('Invalid faceKey')
+          return
+        }
+
+        readJsonBody(req, (parsed) => {
+          if (!parsed || typeof parsed !== 'object') {
+            res.statusCode = 400
+            res.end('Invalid body')
+            return
+          }
+          const body = parsed as Record<string, unknown>
+          const maskBuffer = decodeBase64Png(body.maskPng)
+          if (!maskBuffer) {
+            res.statusCode = 400
+            res.end('Invalid maskPng')
+            return
+          }
+          const prompt = typeof body.prompt === 'string' ? body.prompt : ''
+
+          const faceFile = `cube-capture-${captureIndex}-${faceKey}.png`
+          const facePath = path.join(dir, faceFile)
+          if (!fs.existsSync(facePath)) {
+            res.statusCode = 404
+            res.end('Captured face not found')
+            return
+          }
+
+          const maskFile = `cube-capture-${captureIndex}-${faceKey}-mask.png`
+          const inpaintedFile = `cube-capture-${captureIndex}-${faceKey}-inpainted.png`
+          const maskPath = path.join(dir, maskFile)
+          const outputPath = path.join(dir, inpaintedFile)
+          fs.mkdirSync(dir, { recursive: true })
+          fs.writeFileSync(maskPath, maskBuffer)
+
+          // NOTE: .claude/scripts/composite/inpaint-cube-face.mjs may not exist yet during
+          // development (it ships in Phase 1, Wave 1 agent 1.6). The spawn is wired correctly
+          // regardless; a missing script surfaces as a non-zero exit / spawn error below.
+          const scriptPath = path.join(repoRoot, '.claude', 'scripts', 'composite', 'inpaint-cube-face.mjs')
+          const result = spawnSync('node', [
+            scriptPath,
+            '--face-png', facePath,
+            '--mask-png', maskPath,
+            '--output', outputPath,
+            '--prompt', prompt,
+          ], { cwd: repoRoot, encoding: 'utf-8' })
+
+          if (result.error || result.status !== 0) {
+            res.statusCode = 500
+            res.setHeader('Content-Type', 'application/json')
+            res.end(JSON.stringify({
+              error: 'inpaint failed',
+              message: result.error?.message,
+              status: result.status,
+              stderr: result.stderr,
+            }))
+            return
+          }
+
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({
+            inpaintedUrl: cubeWorldUrl(slug, inpaintedFile),
+            maskUrl: cubeWorldUrl(slug, maskFile),
+          }))
+        }, () => {
+          res.statusCode = 400
+          res.end('Invalid JSON')
+        })
+      })
+
+      // POST /__marble-from-cube?slug=<slug>&captureIndex=<n>
+      // Re-Marbles from the captured cube (equirect or multi-image), spawned detached
+      // because Marble takes minutes; responds immediately with the predicted world index.
+      server.middlewares.use('/__marble-from-cube', (req, res) => {
+        res.setHeader('Cache-Control', 'no-store')
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.end('Method not allowed')
+          return
+        }
+        const requestUrl = new URL(req.url || '/', 'http://localhost')
+        const slug = requestUrl.searchParams.get('slug')
+        const captureIndexParam = requestUrl.searchParams.get('captureIndex')
+        if (!slug) {
+          res.statusCode = 400
+          res.end('Missing slug')
+          return
+        }
+        const dir = outputWorldDir(slug)
+        if (!dir) {
+          res.statusCode = 400
+          res.end('Invalid slug')
+          return
+        }
+        const captureIndex = Number(captureIndexParam)
+        if (captureIndexParam === null || !Number.isInteger(captureIndex)) {
+          res.statusCode = 400
+          res.end('Invalid captureIndex')
+          return
+        }
+
+        readJsonBody(req, (parsed) => {
+          if (!parsed || typeof parsed !== 'object') {
+            res.statusCode = 400
+            res.end('Invalid body')
+            return
+          }
+          const body = parsed as Record<string, unknown>
+          const mode = body.mode
+          const seed = body.seed
+          if (typeof seed !== 'number' || !Number.isInteger(seed)) {
+            res.statusCode = 400
+            res.end('Invalid seed')
+            return
+          }
+
+          const scriptPath = path.join(repoRoot, '.claude', 'scripts', 'world', 'generate-world.mjs')
+          let args: string[]
+
+          if (mode === 'equirect') {
+            const equirectBuffer = decodeBase64Png(body.equirectPng)
+            if (!equirectBuffer) {
+              res.statusCode = 400
+              res.end('Invalid equirectPng')
+              return
+            }
+            const equirectFile = `cube-capture-${captureIndex}-equirect.png`
+            fs.mkdirSync(dir, { recursive: true })
+            fs.writeFileSync(path.join(dir, equirectFile), equirectBuffer)
+            args = [
+              scriptPath,
+              '--world', slug,
+              '--image', cubeWorldRel(slug, equirectFile),
+              '--is-pano',
+              '--seed', String(seed),
+              '--disable-recaption',
+            ]
+          } else if (mode === 'multi-image') {
+            const azimuthFaces = body.azimuthFaces
+            if (!azimuthFaces || typeof azimuthFaces !== 'object') {
+              res.statusCode = 400
+              res.end('Missing azimuthFaces')
+              return
+            }
+            const azRecord = azimuthFaces as Record<string, unknown>
+            const azKeys = ['0', '90', '180', '270'] as const
+            const azFiles: Record<string, string> = {}
+            fs.mkdirSync(dir, { recursive: true })
+            for (const az of azKeys) {
+              const decoded = decodeBase64Png(azRecord[az])
+              if (!decoded) {
+                res.statusCode = 400
+                res.end(`Invalid or missing azimuth face: ${az}`)
+                return
+              }
+              const azFile = `cube-capture-${captureIndex}-az${az}.png`
+              fs.writeFileSync(path.join(dir, azFile), decoded)
+              azFiles[az] = cubeWorldRel(slug, azFile)
+            }
+            const multiImageSpec = azKeys.map((az) => `${azFiles[az]}@${az}`).join(',')
+            args = [
+              scriptPath,
+              '--world', slug,
+              '--multi-image', multiImageSpec,
+              '--reconstruct-images',
+              '--seed', String(seed),
+              '--disable-recaption',
+            ]
+          } else {
+            res.statusCode = 400
+            res.end('Invalid mode')
+            return
+          }
+
+          const pendingWorldIndex = nextWorldIndex(slug)
+          // Detached + unref so the request returns before Marble (minutes) completes.
+          const child = spawn('node', args, {
+            cwd: repoRoot,
+            detached: true,
+            stdio: 'ignore',
+          })
+          child.unref()
+
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ pendingWorldIndex, processId: child.pid, mode }))
+        }, () => {
+          res.statusCode = 400
+          res.end('Invalid JSON')
+        })
+      })
+
+      // GET /__world-versions?slug=<slug> — expose existing readWorldVersions(slug).
+      server.middlewares.use('/__world-versions', (req, res) => {
+        res.setHeader('Cache-Control', 'no-store')
+        if (req.method && req.method !== 'GET') {
+          res.statusCode = 405
+          res.end('Method not allowed')
+          return
+        }
+        const requestUrl = new URL(req.url || '/', 'http://localhost')
+        const slug = requestUrl.searchParams.get('slug')
+        if (!slug) {
+          res.statusCode = 400
+          res.end('Missing slug')
+          return
+        }
+        if (!sceneProjectPath(slug)) {
+          res.statusCode = 400
+          res.end('Invalid slug')
+          return
+        }
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify(readWorldVersions(slug)))
+      })
+
       server.middlewares.use('/worlds', (req, res, next) => {
         const requestPath = decodeURIComponent((req.url || '/').split('?')[0])
         const filePath = path.resolve(worldsDir, `.${requestPath}`)

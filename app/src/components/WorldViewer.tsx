@@ -1,9 +1,16 @@
-import { Component, Suspense, useRef, useEffect, useState, type ReactNode } from 'react'
+import { Component, Suspense, useRef, useEffect, useState, useCallback, type ReactNode } from 'react'
 import { Tooltip } from '@radix-ui/themes'
 import { ArrowsClockwiseIcon, CaretDownIcon, CaretUpIcon } from '@phosphor-icons/react'
 import { Canvas } from '@react-three/fiber'
 import { Physics } from '@react-three/rapier'
-import { SplatRenderer } from '../modules/splat/SplatRenderer'
+import type { SparkRenderer } from '@sparkjsdev/spark'
+import { CompositeRenderer } from './CompositeRenderer'
+// SplatRenderer is no longer mounted directly here — CompositeRenderer handles
+// both the legacy single-splat path and multi-layer compositing.
+import { CubeCaptureController } from '../modules/cubecapture/CubeCaptureController'
+import { CubeFacePicker } from '../modules/cubecapture/CubeFacePicker'
+import { MaskPainter } from '../modules/cubecapture/MaskPainter'
+import { MarbleModePicker } from '../modules/cubecapture/MarbleModePicker'
 import { EnvironmentMap } from '../modules/environment/EnvironmentMap'
 import { WorldCollider } from '../modules/collider/WorldCollider'
 import { GroundPlane } from '../modules/collider/GroundPlane'
@@ -142,6 +149,9 @@ export function WorldViewer({
   refreshingWorlds = false,
 }: Props) {
   const charRef = useRef<CharHandle>(null)
+  // Holds the primary splat's live SparkRenderer so CubeCaptureController can
+  // render the splat scene into a cube at the user's current camera position.
+  const sparkRendererRef = useRef<SparkRenderer | null>(null)
   const worldRenderMode = useDebugStore((s) => s.worldRenderMode)
   const objectRenderMode = useDebugStore((s) => s.objectRenderMode)
   const viewerQuality = useDebugStore((s) => s.viewerQuality)
@@ -168,6 +178,20 @@ export function WorldViewer({
   }, [controllerResetToken])
 
   const splatUrl = desiredWorld ? getSplatUrl(desiredWorld) : ''
+  // Patch (composition) layers reference a world by index N. Their full-res
+  // splat lives at the standard indexed path served by the /worlds middleware.
+  // WorldViewer doesn't receive the full worldVersions list, so we construct the
+  // local URL directly by index (matches getSplatUrl's full_res output).
+  const resolveLayerSplatUrl = useCallback(
+    (worldIndex: number): string | undefined =>
+      `/worlds/${desiredSlug}/output/world/${worldIndex}-world-full_res.spz`,
+    [desiredSlug],
+  )
+  // Seed shared between World A and any patch World B so re-Marble stays
+  // structurally consistent. The primary World object doesn't surface the
+  // recorded seed in its type, so we fall back to a stable default (42). If the
+  // seed is later threaded through `World`, swap it in here.
+  const marbleSeed = 42
   const { ground_plane_offset, flip_y, metric_scale_factor } = desiredWorld?.assets.splats.semantics_metadata ?? DEFAULT_WORLD_SEMANTICS
   const flipY = flip_y ?? true
   const baseMetricScaleFactor = metric_scale_factor ?? 1
@@ -211,6 +235,15 @@ export function WorldViewer({
   const activeShadowCatcherColor = shadowCatcherColor(sceneShadowCatcherColor ?? DEFAULT_SHADOW_CATCHER_COLOR)
   const objectPlacements = sceneProject?.instances ?? placementEditor.instances
   const objectPhysicsAssets = sceneProject?.instances.length ? allObjectAssets : desiredObjectAssets
+  // When editing, composite the editor's live layers (so newly added patch
+  // worlds / erasers render before save); otherwise use the saved sceneProject.
+  // Either way, absence of `worlds` falls through to CompositeRenderer's legacy
+  // single-splat path, preserving backward compatibility.
+  const compositeProject: WorldSceneProject | undefined = editing
+    ? (placementEditor.worlds.length
+        ? { ...(sceneProject ?? { version: 1, instances: [] }), worlds: placementEditor.worlds }
+        : sceneProject)
+    : sceneProject
   const activeControllerMode = editing ? 'fly' : controllerMode
   const hoveredObjectAsset = hoveredObjectAssetId
     ? allObjectAssets.find((asset) => asset.assetId === hoveredObjectAssetId)
@@ -274,14 +307,21 @@ export function WorldViewer({
           </Physics>
           {splatUrl && (
             <OptionalAssetBoundary label={splatUrl} resetKey={splatUrl}>
-              <SplatRenderer
-                url={splatUrl}
+              <CompositeRenderer
+                project={compositeProject}
+                primaryWorld={desiredWorld}
+                primarySplatUrl={splatUrl}
                 visible={showSplat}
                 groundPlaneOffset={activeGroundPlaneOffset}
                 flipY={flipY}
                 metricScaleFactor={activeMetricScaleFactor}
+                resolveLayerSplatUrl={resolveLayerSplatUrl}
+                sparkRendererRef={sparkRendererRef}
               />
             </OptionalAssetBoundary>
+          )}
+          {editing && (
+            <CubeCaptureController slug={desiredSlug} sparkRenderer={sparkRendererRef} />
           )}
           <directionalLight
             castShadow={isHighQuality && activeSunIntensity > 0}
@@ -322,6 +362,15 @@ export function WorldViewer({
         />
       )}
       {editing && uiVisible && <PlacementEditorOverlay controller={placementEditor} />}
+      {/* Cube-capture DOM overlays — each self-gates on the capture store phase
+          and renders null otherwise. Only mounted in edit mode. */}
+      {editing && (
+        <>
+          <CubeFacePicker />
+          <MaskPainter slug={desiredSlug} />
+          <MarbleModePicker slug={desiredSlug} marbleSeed={marbleSeed} />
+        </>
+      )}
     </>
   )
 }
